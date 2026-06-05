@@ -1108,8 +1108,101 @@ microtrace> 10:23 - 10:30
 **关于"用户主动补料"**（Q3 待定）：
 - 用户在 REPL 顶层（不在 ASK_USER 态时）输入信息时，行为待定
 
-### Q2. ASK_USER 触发：LLM 自决 vs 白名单？
-（不变）LLM 自决 + Doom Loop 触发（**新增第二种触发**）
+### Q2. ASK_USER 触发 + 护栏 + UI ✅ **已决定**（与 OpenCode 保持一致）
+
+**决定**（老板 2026-06-05）："都跟 Open code 保持一致"
+
+**三层设计**：
+
+#### Q2a 触发机制
+
+- **触发 1（主）**：LLM 自决（`prompts/agent.md` 教它何时该问）
+- **触发 2（兜底）**：Doom Loop（OpenCode 模式，连续 3 次精确匹配工具调用触发 `permission.ask`，复用 ASK_USER 态）
+
+#### Q2b 护栏：纯 Prompt（**与 OpenCode 一致**）
+
+OpenCode **没有**代码级 rate limit。老板决定 follow 它——护栏全部在 `prompts/agent.md`。
+
+OpenCode `codex.txt` 的核心规则（直接借鉴到我们的 `agent.md`）：
+
+```markdown
+- Default: do the work without asking questions. Treat short tasks as 
+  sufficient direction; infer missing details by reading the codebase.
+  
+- Questions: only ask when you are truly blocked AND you cannot safely 
+  pick a reasonable default. This usually means one of:
+  * The request is ambiguous in a way that materially changes the result
+  * The action is destructive/irreversible, touches production
+  * You need a secret/credential/value that cannot be inferred
+  
+- If you must ask: do all non-blocked work first, then ask exactly ONE 
+  targeted question, include your recommended default, and state what 
+  would change based on the answer.
+  
+- Never ask permission questions like "Should I proceed?"; proceed with 
+  the most reasonable option and mention what you did.
+```
+
+#### Q2c UI：多选 + 自定义文本（**OpenCode 模式**）
+
+`Question.Prompt` schema（来自 `src/question/index.ts`）：
+
+```python
+@dataclass
+class QuestionOption:
+    label: str           # 1-5 字
+    description: str     # 解释选项
+
+@dataclass
+class QuestionPrompt:
+    question: str
+    header: str          # 短标签（max 30 字）
+    options: list[QuestionOption]
+    multiple: bool = False     # 是否多选
+    custom: bool = True        # 允许自定义答案
+```
+
+**REPL 渲染**：
+
+```
+╭─ ⚠️ microtrace · 等待输入 (Q2) ─────────────────╮
+│  触发: LLM 自决                                  │
+│  第 3 轮 · 已用 2 次工具调用                      │
+│                                                  │
+│  报错时间窗口大概是？                              │
+│  (用于精确定位 search_logs)                        │
+│                                                  │
+│  [1] 10:00 - 11:00   # 整点范围                   │
+│  [2] 10:23 - 10:30   # 我看到日志有报错时间        │
+│  [3] 不知道          # 让 agent 自己查              │
+│  [4] 自定义...                                     │
+│                                                  │
+│  → 输入数字 1/2/3/4 选中                          │
+╰──────────────────────────────────────────────────╯
+
+microtrace> 2
+[15:23:45] 收到回复：[10:23 - 10:30]
+```
+
+#### Q2d 4 条原则（**全部采纳**写进 `prompts/agent.md`）
+
+1. **默认不问** —— "do the work without asking questions"
+2. **infer 优先** —— "Treat short tasks as sufficient direction; infer missing details"
+3. **3 个明确 OK 场景** —— 模糊 / 破坏性 / 需要 secret（其他都不要问）
+4. **一次 1 个问题** —— "ask exactly ONE targeted question, include your recommended default"
+
+#### 为什么放弃代码级 rate limit
+
+- 老板明确跟 OpenCode 走
+- OpenCode 实战验证了纯 prompt 够用
+- 代码 rate limit 留作"未来真出问题再加"的 YAGNI 候选
+- prompt 写得好的话 LLM 会自己学会不乱问
+
+#### 关于我之前提议的"代码 rate limit"——降级为**可选**
+
+- Phase 0 不做代码 rate limit
+- 如果将来发现 LLM 真的乱问（比如 prompt 写得不好），**再加** `AskUserGuard` 类
+- 但**默认不启用**
 
 ### Q3. judgment_update：覆盖还是版本化？
 （不变）覆盖，理由已在 v1
