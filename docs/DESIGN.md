@@ -1204,8 +1204,66 @@ microtrace> 2
 - 如果将来发现 LLM 真的乱问（比如 prompt 写得不好），**再加** `AskUserGuard` 类
 - 但**默认不启用**
 
-### Q3. judgment_update：覆盖还是版本化？
-（不变）覆盖，理由已在 v1
+### Q3. judgment_update：覆盖 vs 版本化 ✅ **已决定 → 版本化**
+
+**决定**（老板 2026-06-05）：**版本化 + 保留 current**。
+
+老板原话：
+> "我觉得是不是有这种历史记录的比较好，至少知道都判断过哪些可能性... 这样在我们目前的 agent 能力构建阶段，还没有这么强的时候，我可以基于这个进行一些调试和优化"
+
+**数据结构**：
+
+```python
+@dataclass
+class Context:
+    current_judgment: Judgment           # 最新值（单例）
+    judgment_history: list[Judgment]     # 全部历史（append-only）
+    
+    def update_judgment(self, new: Judgment) -> None:
+        old = self.current_judgment
+        self.current_judgment = new
+        self.judgment_history.append(new)
+        self.append_reasoning(
+            f"[判断更新 #{len(self.judgment_history)}] "
+            f"{old.category}→{new.category}, "
+            f"confidence={old.confidence:.2f}→{new.confidence:.2f}"
+        )
+```
+
+**REPL 增强**（`/judgment` 命令）：
+
+```
+microtrace> /judgment
+
+判断历史（4 次更新）：
+
+  #1  iter=1  UNKNOWN→A  0.50→0.55
+      "NPE 在我们代码，没看到校验拦截"
+      
+  #2  iter=3  A→A  0.55→0.70
+      "读代码确认 userId 来自 OrderService"
+      
+  #3  iter=5  A→B  0.70→0.82  ★ 翻车
+      "日志显示 downstream OMS returned 500"
+      
+  #4  iter=6  B→B  0.82→0.88
+
+当前: B (下游产品报错)  0.88
+```
+
+**关键标记**：
+- `★ 翻车` —— 类别方向变化（UNKNOWN→A、A→B、C→A 等）
+- `→同` —— 类别不变，置信度变化
+
+**为什么不是覆盖**：
+- 开发阶段 agent 还不强，**history 是 debug 神器**
+- 出错时能直接看"当时怎么想的"
+- 调优 prompt 时看"agent 在哪里翻来覆去"
+- 成本几乎为零（几 KB 存储）
+
+**未来**（agent 强了以后）：
+- 如果觉得 history 啰嗦，可以加 `/judgment clear` 命令手动清
+- 或者只保留最近 N 次（但默认不砍，保留全量）
 
 ### Q4. max_iterations = 8？
 **修订**：max_iterations **= 8**（主）+ **compaction 触发**（避免提前达上限）
