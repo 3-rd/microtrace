@@ -1530,11 +1530,110 @@ CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC);
 
 清理：直接 `rm` 那个 .db 文件（**真·零运维**）
 
-### Q7. tool_call 并行？
-**修订**：**默认并行**（OpenCode 模式）
-- 选项 A：收到多个则并行（**当前倾向**）
-- 选项 B：一次只一个
-- 选项 C：LLM 显式声明
+### Q7. tool_call 并行 ✅ **已决定 → 默认并行，LLM 自己判断**
+
+**决定**（老板 2026-06-05）："按现在推荐的来"
+
+#### 跟 OpenCode 完全对齐
+
+OpenCode 8 个 prompt 文件（anthropic / codex / gemini / gpt / kimi / default）的统一原则：
+
+```markdown
+# anthropic.txt:
+"You can call multiple tools in a single response. If you intend to call
+multiple tools and there are no dependencies between them, make all
+independent tool calls in parallel. Maximize use of parallel tool calls
+where possible to increase efficiency. However, if some tool calls depend
+on previous calls to inform dependent values, do NOT call these tools
+in parallel and instead call them sequentially."
+
+# codex.txt:
+"Run tool calls in parallel when neither call needs the other's output;
+otherwise run sequentially."
+
+# gemini.txt:
+"Execute multiple independent tool calls in parallel when feasible."
+```
+
+**核心**：**prompt 教 LLM 怎么判断独立性** + **代码自动并行** + **不代码做 dependency 检查**
+
+#### Q7a 并行策略：默认并行
+
+- LLM 在一次响应里返回多个 tool_call → agent 自动并行执行
+- LLM 自己判断"独立 / 依赖"——prompt 教学
+
+#### Q7b Dependency 判断：LLM 自己判断
+
+**为什么不做代码 dependency 分析**：
+- 静态分析 "A 是否依赖 B 的输出" 极难
+- LLM 自己最清楚"我接下来需要什么"
+- OpenCode 也不做（**8/8 prompt 都是同一句话**）
+
+**Prompt 教学**（写到 `prompts/agent.md`）：
+
+```markdown
+## Parallel tool calls
+
+If you need to call multiple tools and they are **independent** (one
+doesn't need the other's output), make all of them in the **same response**.
+The agent will execute them in parallel.
+
+**Independent (parallel OK):**
+- `find_class(X)` + `search_logs(Y)` — different sources
+- `read_file(A)` + `read_file(B)` — different files
+- `search_logs(K1)` + `search_logs(K2)` — different keywords
+
+**Dependent (must be sequential):**
+- `parse_stack_trace(...)` → `find_class(...)` — parse result tells you what
+- `read_file(X)` → 解析内容 → 决定下一步 — need output first
+
+**Rule of thumb**: if you can describe both tools' purposes without
+mentioning the other's result, they're independent → parallel.
+```
+
+#### Q7c 错误处理：`asyncio.gather(..., return_exceptions=True)`
+
+```python
+results = await asyncio.gather(
+    *[execute_tool(call) for call in tool_calls],
+    return_exceptions=True,  # ← 关键：隔离错误
+)
+
+for call, result in zip(tool_calls, results):
+    if isinstance(result, Exception):
+        # 工具失败，不影响其他并行工具
+        ctx.add_evidence(Evidence(
+            source="error",
+            content=f"Tool {call.name} failed: {result}",
+            importance="background",
+        ))
+    else:
+        ctx.add_evidence(...)
+```
+
+**并行 + 错误隔离**：一个工具挂了，其他成功的结果照样进 context。
+
+#### 代码极简
+
+```python
+# 一次 LLM 响应结束后
+if len(tool_calls) > 1:
+    results = await asyncio.gather(*[
+        execute_tool(call) for call in tool_calls
+    ], return_exceptions=True)
+elif len(tool_calls) == 1:
+    result = await execute_tool(tool_calls[0])
+# else: judgment_update / ask_user / conclude
+```
+
+**无 dependency 检查**——信任 LLM。
+
+#### 为什么不是"代码 dependency 检查"（B 选项）
+
+- VNFM 场景下 dependency 极难静态分析
+- "parse_stack_trace 后 find_class"——**结果决定下一步**
+- LLM 自己最清楚上下文
+- OpenCode 实战验证：**prompt 教学 + 不代码检查**就够
 
 ### Q8. **新增** Compaction 策略：滚动 vs 全量？
 - A）滚动压缩（保留 critical + 摘要其他，**当前倾向**）
