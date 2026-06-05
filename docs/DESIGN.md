@@ -1361,8 +1361,67 @@ DO NOT make any tool calls. Text only.
 - 如果 agent 经常"8 轮卡在有价值的工作上" → 改默认到 12
 - 如果 compaction 验证稳定 → 考虑 12 或 15
 
-### Q5. evidence relevance：谁评？
-（不变）LLM 自评，倾向 A
+### Q5. evidence relevance：谁评？✅ **已决定 → LLM 自评**
+
+**决定**（老板 2026-06-05）：**LLM 自评**
+
+老板原话：
+> "opencode 应该没有这个相关能力，我建议由 llm 给吧，工具无法做到语义或者全局上的评价"
+
+**为什么是 LLM 自评**：
+- Relevance 是**语义级**评价（"这条证据对判断 A/B/C 有多少帮助"）
+- **只有 LLM 能做全局语义评估**
+- 工具只能做局部指标（关键词密度、字符长度等），不能跨工具 / 跨证据评估
+- OpenCode **没有**这个概念（grep 确认），我们独立设计
+
+**OpenCode 调研结果**（2026-06-05）：
+- ❌ OpenCode 没有 evidence relevance 概念
+- 只有 Copilot SDK 的 file-search 有个 `score`，那是 SDK 内部用的，跟 agent 无关
+
+**实现方式**：
+
+LLM 在每次 tool_call 后返回的响应里**多带一个字段**：
+
+```json
+{
+  "action": "tool_call",
+  "tool_name": "find_class",
+  "tool_args": {"class_name": "UserService"},
+  "evidence_evaluation": {
+    "relevance": 0.85,
+    "importance": "critical",
+    "reason": "this is the class that threw the NPE"
+  }
+}
+```
+
+**字段含义**：
+- `relevance` (0-1) —— 这条证据对当前判断 A/B/C 的帮助度
+- `importance` (critical / supporting / background) —— 这条证据在整体证据池中的位置
+- `reason` —— 一句话解释为什么给这个分
+
+**存储**：
+
+```python
+@dataclass
+class Evidence:
+    id: str
+    source: str
+    location: str
+    content: str
+    relevance: float       # LLM 自评
+    importance: str        # LLM 自评
+    discovered_at_iteration: int
+```
+
+**用量**：
+- 每个 tool_call 之后 LLM 多 1 个字段（约 50-100 token）
+- 8 轮 = 800 token 额外成本（**可接受**）
+
+**使用场景**：
+- 喂 LLM 时按 `relevance` 降序排序（高分优先进入 prompt）
+- Compaction 时按 `importance` 决定保留（critical 不压）
+- 截取时按 `relevance` 选 top-N
 
 ### Q6. Session 持久化？
 **新增选项**：
