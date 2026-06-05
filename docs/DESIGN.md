@@ -1635,12 +1635,185 @@ elif len(tool_calls) == 1:
 - LLM 自己最清楚上下文
 - OpenCode 实战验证：**prompt 教学 + 不代码检查**就够
 
-### Q8. **新增** Compaction 策略：滚动 vs 全量？
-- A）滚动压缩（保留 critical + 摘要其他，**当前倾向**）
-- B）全量 summarization
-- C）只在 prompt 层截取，不在 context 层压缩
+### Q8. Compaction 策略 ✅ **已决定 → 按内容类型分（structural 分类）**
 
-**当前倾向**：A（与 OpenCode 思路一致）
+**决定**（老板 2026-06-05）："都按推荐方案吧"
+
+**核心思路**（老板原话 2026-06-05）：
+> "分析清上下文的组成，根据不同性质的 prompt 进行不同的处理...系统上下文，工具描述等是永远不会压缩的...待定位问题描述，关键证据，judgement 历史，推理链等...永不压缩...对话历史，工具调用记录，比如查日志返回的大量日志内容，源码分析等可以进行压缩"
+
+#### Q8a 分类法：**按内容类型（structural）**
+
+不是 LLM 自评 importance，是**结构化分类**（按 source + 元数据自动判定）。
+
+| 我之前（按 importance） | 老板方案（按类型） |
+|---|---|
+| LLM 评 importance | **结构规则自动定** |
+| 主观 | **客观** |
+| LLM 评分可能错 | **硬规则**，不会错 |
+| 与"严谨推理"间接对齐 | **直接对齐**——关键证据靠"类型"锁定 |
+
+#### Q8b 永不压缩区（**结构规则**，始终全量进 prompt）
+
+```python
+# 7 类内容永不压缩
+NEVER_COMPRESS = {
+    "system_prompt",          # agent.md
+    "tool_descriptions",       # 4 个工具的 schema
+    "problem",                # 用户的报错输入
+    "current_judgment",       # 最新判断（单值）
+    "critical_evidence",      # per-evidence（结构判定为 critical）
+    "reasoning_trace",        # 最近 K 步推理
+    "judgment_history",       # 判断演变（单值序列）
+}
+```
+
+**结构判定规则**（自动）：
+
+```python
+def determine_content_type(ev: Evidence, ctx: Context) -> str:
+    """结构性判定，永不压缩 or 可压缩"""
+    # 规则 1：堆栈帧里的关键 class，永不压缩
+    if ev.source == "stack" and "class_name" in ev.location:
+        return "critical"
+    
+    # 规则 2：包含根因代码位置（@标记），永不压缩
+    if ev.source == "code" and ev.contains_root_cause_marker:
+        return "critical"
+    
+    # 规则 3：日志里 NPE 抛出点（"at X.java:line"），永不压缩
+    if ev.source == "log" and "at " in ev.content and ".java:" in ev.content:
+        return "critical"
+    
+    # 规则 4：早期 evidence（iter 1-2 决定方向），永不压缩
+    if ev.discovered_at_iteration <= 2:
+        return "critical"
+    
+    # 规则 5：其余可压缩
+    return "compressible"
+```
+
+#### Q8c 可压缩区（**compaction 时 summarization**）
+
+```python
+COMPRESSIBLE = {
+    "supporting/background evidence",   # 重要但不根因
+    "large tool outputs",                # 大段日志、源码
+    "old tool_history entries",          # 早期 tool call
+    "early reasoning_trace steps",       # 推理轨迹的早期
+}
+```
+
+#### Q8d 触发：**auto on overflow**（OpenCode 模式）
+
+```python
+COMPACTION_BUFFER = 20_000  # 保留 20K 给 summary（与 OpenCode 一致）
+
+if estimated_tokens >= ctx.model.context_window - COMPACTION_BUFFER:
+    await compact(ctx, llm)
+```
+
+#### Evidence 数据结构（修订）
+
+```python
+@dataclass
+class Evidence:
+    id: str
+    source: str  # code / log / stack / tool_output / error / user
+    
+    # 结构性分类（**自动定**，不是 LLM 评的）
+    content_type: str  # "critical" / "compressible"
+    
+    # 关键性（**LLM 评**，但**只影响排序**）
+    importance: str  # critical / supporting / background
+    
+    # 压缩状态
+    compacted: bool = False
+    compaction_id: str | None = None
+    preserved_reason: str | None = None
+    
+    # 原有字段
+    location: str
+    content: str
+    raw_content: str
+    relevance: float
+    discovered_at_iteration: int
+```
+
+**关键分离**：
+- `content_type` = 结构分类（**控制是否压缩**）
+- `importance` = LLM 评分（**只影响排序**）
+- LLM 评错 importance **不影响**"是否压缩"——这是改进的关键
+
+#### Compaction 实现
+
+```python
+async def compact(ctx: Context, llm: LLMClient) -> CompactionRecord:
+    # 1. 分离（基于 content_type）
+    never_compress = [ev for ev in ctx.evidence if ev.content_type == "critical"]
+    compressible = [ev for ev in ctx.evidence if ev.content_type == "compressible"]
+    
+    # 2. 调 LLM summarization（只 summarization 可压缩区）
+    summary = await llm.summarize(
+        evidence=compressible,
+        recent_tool_outputs=ctx.tool_history[-5:],
+    )
+    
+    # 3. 标记可压缩区为 compacted（raw_content 仍在 context）
+    for ev in compressible:
+        ev.compacted = True
+    
+    # 4. 记录
+    record = CompactionRecord(
+        triggered_at_iteration=ctx.iteration,
+        reason="auto_overflow",
+        tokens_before=ctx.cumulative_tokens,
+        summary=summary,
+        preserved_ids=[ev.id for ev in never_compress],
+    )
+    ctx.compactions.append(record)
+    return record
+```
+
+#### Prompt 组装（合并你的分区）
+
+```python
+def _assemble_prompt(ctx, tools):
+    sections = []
+    
+    # 永不压缩区（全量）
+    sections.append(_load_system_prompt())
+    sections.append(_format_tools(tools))
+    sections.append(_format_problem(ctx.problem))
+    sections.append(_format_current_judgment(ctx))
+    sections.append(_format_critical_evidence_pool(ctx))  # 仅 critical
+    
+    # 压缩摘要区（如果有）
+    if ctx.compactions:
+        sections.append(_format_compactions(ctx.compactions[-2:]))
+    
+    # 未压缩的非 critical evidence（少数）
+    non_compacted = [ev for ev in ctx.evidence 
+                     if ev.content_type == "compressible" and not ev.compacted]
+    if non_compacted:
+        sections.append(_format_evidence_pool(non_compacted[:3]))
+    
+    # 推理轨迹
+    sections.append(_format_reasoning_trace(ctx.reasoning_trace, max_steps=3))
+    
+    # 用户补料
+    if ctx.user_replies:
+        sections.append(_format_user_replies(ctx.user_replies))
+    
+    # 指令
+    sections.append(_build_instruction(ctx))
+    
+    return "\n\n".join(sections)
+```
+
+#### 跟 OpenCode 完美对齐
+
+OpenCode 的 `AGENTS.md`（系统 prompt）**永不全量压缩**——跟我们"system_prompt 永不压缩"是同一原则。工具定义、用户报错输入同理。
 
 ### Q9. **新增** Compaction 触发阈值：buffer = 20K？
 - A）固定 20K（**当前倾向，与 OpenCode 一致**）
