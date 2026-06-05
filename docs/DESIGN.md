@@ -1635,102 +1635,208 @@ elif len(tool_calls) == 1:
 - LLM 自己最清楚上下文
 - OpenCode 实战验证：**prompt 教学 + 不代码检查**就够
 
-### Q8. Compaction 策略 ✅ **已决定 → 按内容类型分（structural 分类）**
+### Q8. Compaction 策略 ✅ **已决定 → 拆分：OpenCode 共用 + microtrace 独有**
 
-**决定**（老板 2026-06-05）："都按推荐方案吧"
+**决定**（老板 2026-06-05）："和 opencode 共通的 context 就采纳它的机制，然后我们独有的那些用于问题定位的 context 就按我们的策略来"
 
-**核心思路**（老板原话 2026-06-05）：
-> "分析清上下文的组成，根据不同性质的 prompt 进行不同的处理...系统上下文，工具描述等是永远不会压缩的...待定位问题描述，关键证据，judgement 历史，推理链等...永不压缩...对话历史，工具调用记录，比如查日志返回的大量日志内容，源码分析等可以进行压缩"
+**核心拆分**：
 
-#### Q8a 分类法：**按内容类型（structural）**
-
-不是 LLM 自评 importance，是**结构化分类**（按 source + 元数据自动判定）。
-
-| 我之前（按 importance） | 老板方案（按类型） |
-|---|---|
-| LLM 评 importance | **结构规则自动定** |
-| 主观 | **客观** |
-| LLM 评分可能错 | **硬规则**，不会错 |
-| 与"严谨推理"间接对齐 | **直接对齐**——关键证据靠"类型"锁定 |
-
-#### Q8b 永不压缩区（**结构规则**，始终全量进 prompt）
-
-```python
-# 7 类内容永不压缩
-NEVER_COMPRESS = {
-    "system_prompt",          # agent.md
-    "tool_descriptions",       # 4 个工具的 schema
-    "problem",                # 用户的报错输入
-    "current_judgment",       # 最新判断（单值）
-    "critical_evidence",      # per-evidence（结构判定为 critical）
-    "reasoning_trace",        # 最近 K 步推理
-    "judgment_history",       # 判断演变（单值序列）
-}
+```
+┌─ OpenCode 通用机制（**直接复用**）──────────────────────┐
+│  PRUNE（不调 LLM，标记 time.compacted）                  │
+│  SUMMARY_TEMPLATE（8-section 强制结构）                  │
+│  Anchored summary（累积更新，不递归）                    │
+│  DEFAULT_TAIL_TURNS = 2（最近 2 轮全保）                 │
+│  PRUNE_PROTECT = 40K / PRUNE_MINIMUM = 20K               │
+│  TOOL_OUTPUT_MAX_CHARS = 2000（单条截取）                │
+│  PRUNE_PROTECTED_TOOLS = ["skill"]                       │
+└──────────────────────────────────────────────────────────┘
+┌─ microtrace 独有策略（**按问题定位定制**）──────────────┐
+│  5 条结构规则（critical vs compressible 自动判定）        │
+│  3 分类 judgment（A/B/C）                                │
+│  Content_type 字段（不是 importance 评分）                │
+│  严密的证据链必杀技（每条结论必须能引用）                │
+│  业务定位的 tool_results 关键内容保留                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**结构判定规则**（自动）：
+#### OpenCode 通用机制（直接复用）
+
+**PRUNE（不调 LLM）**：
 
 ```python
-def determine_content_type(ev: Evidence, ctx: Context) -> str:
-    """结构性判定，永不压缩 or 可压缩"""
-    # 规则 1：堆栈帧里的关键 class，永不压缩
+# src/session/compaction.ts:166-189
+TOOL_OUTPUT_MAX_CHARS = 2000
+PRUNE_PROTECT = 40_000
+PRUNE_MINIMUM = 20_000
+
+def prune_old_tool_outputs(ctx, db):
+    """从最早的消息开始，删 tool output 的 raw content"""
+    for part in reversed(ctx.tool_history):
+        if part.time.compacted: break  # 之前已 prune
+        if part.tool in PRUNE_PROTECTED_TOOLS: continue
+        part.content = ""  # 清空 raw
+        part.time.compacted = ctx.iteration  # 标记
+    db.save()
+```
+
+**SUMMARY_TEMPLATE（8-section 强制结构）**：
+
+```python
+SUMMARY_TEMPLATE = """
+## Goal
+- [single-sentence task summary]
+
+## Constraints & Preferences
+- [user constraints, preferences, specs, or "(none)"]
+
+## Progress
+### Done
+- [completed work or "(none)"]
+### In Progress
+- [current work or "(none)"]
+### Blocked
+- [blockers or "(none)"]
+
+## Key Decisions
+- [decision and why, or "(none)"]
+
+## Next Steps
+- [ordered next actions or "(none)"]
+
+## Critical Context
+- [important technical facts, errors, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, commands, error strings, and identifiers when known.
+- Do not mention the summary process or that context was compacted.
+"""
+```
+
+**Anchored summary（累积更新）**：
+
+```python
+def build_summary_prompt(previous_summary, new_messages):
+    if previous_summary:
+        return f"""Update the anchored summary below using the new messages.
+Preserve still-true details, remove stale details, and merge in the new facts.
+
+<previous-summary>
+{previous_summary}
+</previous-summary>
+
+{SUMMARY_TEMPLATE}"""
+    else:
+        return f"Create a new anchored summary from the messages.
+
+{SUMMARY_TEMPLATE}"
+```
+
+**DEFAULT_TAIL_TURNS = 2（最近 2 轮 turn 全保）**：
+
+```python
+def should_protect(message, recent_user_turns):
+    if message.role == "user":
+        recent_user_turns += 1
+    return recent_user_turns <= 2  # 最近 2 turn 全量保留
+```
+
+#### microtrace 独有策略（问题定位定制）
+
+**5 条结构规则（critical vs compressible 自动判定）**：
+
+```python
+def determine_content_type(ev: Evidence) -> str:
+    """问题定位专用：哪些 evidence 永不压缩"""
+    # 规则 1：堆栈帧里的关键 class
     if ev.source == "stack" and "class_name" in ev.location:
         return "critical"
     
-    # 规则 2：包含根因代码位置（@标记），永不压缩
+    # 规则 2：根因代码位置（@标记）
     if ev.source == "code" and ev.contains_root_cause_marker:
         return "critical"
     
-    # 规则 3：日志里 NPE 抛出点（"at X.java:line"），永不压缩
+    # 规则 3：日志里 NPE 抛出点（"at X.java:line"）
     if ev.source == "log" and "at " in ev.content and ".java:" in ev.content:
         return "critical"
     
-    # 规则 4：早期 evidence（iter 1-2 决定方向），永不压缩
-    if ev.discovered_at_iteration <= 2:
+    # 规则 4：早期 evidence（决定方向，iter ≤ max_iterations/2）
+    if ev.discovered_at_iteration <= ctx.max_iterations // 2:
         return "critical"
     
-    # 规则 5：其余可压缩
+    # 规则 5：LLM 评 critical（importance 字段）
+    if ev.importance == "critical":
+        return "critical"
+    
     return "compressible"
 ```
 
-#### Q8c 可压缩区（**compaction 时 summarization**）
+**双重保护**：
+- OpenCode 通用：turn-based 保护（最近 2 turn 全保）——**机制层**
+- microtrace 独有：5 条结构规则（critical 自动锁定）——**业务层**
+
+**业务定位的 tool_results 关键内容**：
+
+VNFM 问题定位的"关键内容"是什么？**这些必须在 summarization 时保留原文**：
 
 ```python
-COMPRESSIBLE = {
-    "supporting/background evidence",   # 重要但不根因
-    "large tool outputs",                # 大段日志、源码
-    "old tool_history entries",          # 早期 tool call
-    "early reasoning_trace steps",       # 推理轨迹的早期
-}
+MICROTRACE_PRESERVE_PATTERNS = [
+    # Java 异常
+    r"Exception in thread",  # 异常线程
+    r"at\s+[\w\.]+\([\w\.]+\.java:\d+\)",  # 堆栈帧
+    r"Caused by:",
+    # 下游错误码
+    r"error\s*code[:=]?\s*\d{3,4}",
+    r"returned\s+status\s+\d{3}",
+    r"HTTP/\d\.\d\s+\d{3}",
+    # 业务关键标识
+    r"@Transactional",
+    r"@Async",
+    r"@Scheduled",
+    r"@FeignClient",
+    r"@DubboReference",
+    # 日志级别
+    r"(ERROR|FATAL)",
+]
+
+def extract_microtrace_critical_lines(tool_output: str) -> str:
+    """从 tool output 提取 microtrace 关键行（不 summarization）"""
+    lines = tool_output.split("\n")
+    critical = []
+    for line in lines:
+        for pattern in MICROTRACE_PRESERVE_PATTERNS:
+            if re.search(pattern, line):
+                critical.append(line)
+                break
+    return "\n".join(critical[:20])  # 最多 20 行
 ```
 
-#### Q8d 触发：**auto on overflow**（OpenCode 模式）
+**在 OpenCode 的 PRUNE 之前**先做这一步——保留 critical 行，**只 prune 其他**。
 
-```python
-COMPACTION_BUFFER = 20_000  # 保留 20K 给 summary（与 OpenCode 一致）
-
-if estimated_tokens >= ctx.model.context_window - COMPACTION_BUFFER:
-    await compact(ctx, llm)
-```
-
-#### Evidence 数据结构（修订）
+#### Evidence Schema（修订）
 
 ```python
 @dataclass
 class Evidence:
     id: str
-    source: str  # code / log / stack / tool_output / error / user
+    source: str
     
-    # 结构性分类（**自动定**，不是 LLM 评的）
+    # microtrace 独有：结构规则自动判定
     content_type: str  # "critical" / "compressible"
     
-    # 关键性（**LLM 评**，但**只影响排序**）
+    # LLM 评（只影响排序）
     importance: str  # critical / supporting / background
     
-    # 压缩状态
+    # OpenCode 通用：标记被 PRUNE 过
     compacted: bool = False
-    compaction_id: str | None = None
-    preserved_reason: str | None = None
+    
+    # microtrace 独有：保留关键行原文
+    preserved_lines: str = ""  # 即使 compacted，这部分仍可见
     
     # 原有字段
     location: str
@@ -1740,80 +1846,89 @@ class Evidence:
     discovered_at_iteration: int
 ```
 
-**关键分离**：
-- `content_type` = 结构分类（**控制是否压缩**）
-- `importance` = LLM 评分（**只影响排序**）
-- LLM 评错 importance **不影响**"是否压缩"——这是改进的关键
-
-#### Compaction 实现
+#### Compaction Flow（合并两套机制）
 
 ```python
-async def compact(ctx: Context, llm: LLMClient) -> CompactionRecord:
-    # 1. 分离（基于 content_type）
-    never_compress = [ev for ev in ctx.evidence if ev.content_type == "critical"]
-    compressible = [ev for ev in ctx.evidence if ev.content_type == "compressible"]
+async def compact(ctx, llm, db):
+    # 1. microtrace 独有：先从 raw tool output 提取关键行
+    for ev in ctx.evidence:
+        if ev.source in ("log", "code"):
+            ev.preserved_lines = extract_microtrace_critical_lines(ev.raw_content)
     
-    # 2. 调 LLM summarization（只 summarization 可压缩区）
-    summary = await llm.summarize(
-        evidence=compressible,
-        recent_tool_outputs=ctx.tool_history[-5:],
+    # 2. OpenCode 通用：PRUNE 老 tool output（不调 LLM）
+    pruned_count = prune_old_tool_outputs(ctx)
+    #   - 跳过最近 2 turn（DEFAULT_TAIL_TURNS）
+    #   - 跳过 PRUNE_PROTECTED_TOOLS
+    #   - 清空 raw_content，标记 time.compacted
+    
+    # 3. OpenCode 通用：SUMMARY（调 LLM，8-section anchored）
+    previous_summary = ctx.compactions[-1].summary if ctx.compactions else None
+    new_summary = await llm.summarize(
+        previous_summary=previous_summary,
+        messages=ctx.get_messages_for_summary(),
     )
+    #   - 用 SUMMARY_TEMPLATE 强制结构
+    #   - "Preserve exact file paths, error strings, identifiers"
+    #   - microtrace 关键行已在 step 1 提取并写入 preserved_lines
     
-    # 3. 标记可压缩区为 compacted（raw_content 仍在 context）
-    for ev in compressible:
-        ev.compacted = True
+    # 4. microtrace 独有：标记 critical evidence 不被覆盖
+    critical_evidence = [ev for ev in ctx.evidence if ev.content_type == "critical"]
+    #   - critical 永远不进 summary
+    #   - 始终全量进 prompt
     
-    # 4. 记录
+    # 5. 记录 CompactionRecord
     record = CompactionRecord(
-        triggered_at_iteration=ctx.iteration,
-        reason="auto_overflow",
-        tokens_before=ctx.cumulative_tokens,
-        summary=summary,
-        preserved_ids=[ev.id for ev in never_compress],
+        summary=new_summary,
+        preserved_critical_ids=[ev.id for ev in critical_evidence],
+        pruned_count=pruned_count,
     )
     ctx.compactions.append(record)
-    return record
 ```
 
-#### Prompt 组装（合并你的分区）
+#### 用户回答 (user_replies) 保护
 
-```python
-def _assemble_prompt(ctx, tools):
-    sections = []
-    
-    # 永不压缩区（全量）
-    sections.append(_load_system_prompt())
-    sections.append(_format_tools(tools))
-    sections.append(_format_problem(ctx.problem))
-    sections.append(_format_current_judgment(ctx))
-    sections.append(_format_critical_evidence_pool(ctx))  # 仅 critical
-    
-    # 压缩摘要区（如果有）
-    if ctx.compactions:
-        sections.append(_format_compactions(ctx.compactions[-2:]))
-    
-    # 未压缩的非 critical evidence（少数）
-    non_compacted = [ev for ev in ctx.evidence 
-                     if ev.content_type == "compressible" and not ev.compacted]
-    if non_compacted:
-        sections.append(_format_evidence_pool(non_compacted[:3]))
-    
-    # 推理轨迹
-    sections.append(_format_reasoning_trace(ctx.reasoning_trace, max_steps=3))
-    
-    # 用户补料
-    if ctx.user_replies:
-        sections.append(_format_user_replies(ctx.user_replies))
-    
-    # 指令
-    sections.append(_build_instruction(ctx))
-    
-    return "\n\n".join(sections)
-```
+**不用单独条目**——OpenCode 的 **DEFAULT_TAIL_TURNS = 2** 已经覆盖了。
 
-#### 跟 OpenCode 完美对齐
+最近 2 轮 turn 全保 = 最近 2 轮 user 消息 + assistant 响应 + tool 调用 **全量保留**。
 
-OpenCode 的 `AGENTS.md`（系统 prompt）**永不全量压缩**——跟我们"system_prompt 永不压缩"是同一原则。工具定义、用户报错输入同理。
+- user_replies 进"最近 2 轮" → **自然全保**
+- 不需要单独"永不压缩 user_replies"条目
+- 比"永不压缩"更精细（最近 2 轮 vs 全部）
+
+#### system_prompt 版本一致性
+
+**不做**——OpenCode 也没做。Session 启动时加载最新 agent.md，session 内部逻辑一致。
+
+老 session resume 继续用老 prompt（但 agent.md 实际不变）—— 行为合理。
+
+#### judgment_history
+
+**不进 LLM context**（Q3.5 已定）—— 它在 SQLite 里纯粹是 debug 元数据，**压缩不压缩对 agent 推理零影响**。
+
+承认是"伪命题"，不在 Q8 规则表里管它。
+
+#### Compaction 触发
+
+`PRUNE_MINIMUM = 20_000`（OpenCode 默认）—— 跟我们 VISION 一致。
+
+#### 完整规则表（修订版）
+
+| 内容 | 处理 | 来源 |
+|---|---|---|
+| system_prompt | 全保 | OpenCode 通用（AGENTS.md 不压）|
+| tool_descriptions | 全保 | OpenCode 通用（tool schema 不压）|
+| problem | 全保 | OpenCode 通用（user input 不压）|
+| current_judgment | 全保 | OpenCode 通用（state 投影）|
+| critical_evidence | 全保 | **microtrace 独有**（5 条结构规则）|
+| reasoning_trace (last K) | 全保 | OpenCode 通用（tail turns）|
+| user_replies (最近 2 turn) | 全保 | OpenCode 通用（DEFAULT_TAIL_TURNS）|
+| pending_question | 全保 | microtrace 独有（用户显式输入）|
+| supporting evidence | 可压缩 | OpenCode 通用 + microtrace preserved_lines |
+| large tool output | PRUNE + SUMMARY | OpenCode 通用 |
+| old tool_history | PRUNE（不调 LLM）| OpenCode 通用 |
+| early reasoning_trace | 截断 | OpenCode 通用（只 last K）|
+| compaction summary | Anchored | OpenCode 通用（累积更新）|
+| judgment_history | 存不压，**不进 LLM** | microtrace 独有（debug 元数据）|
 
 ### Q9. **新增** Compaction 触发阈值：buffer = 20K？
 - A）固定 20K（**当前倾向，与 OpenCode 一致**）
