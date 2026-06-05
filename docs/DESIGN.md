@@ -2586,3 +2586,187 @@ dependencies = [
     "platformdirs>=4.0",     # 跨平台路径
 ]
 ```
+
+---
+
+## 13. 状态转换审计 & Edge Case 修复 ✅ **已决定**
+
+**决定**（老板 2026-06-05）："按照你推荐的来"（采纳 4 个修复，3 个接受为边缘 case）
+
+### 审计结果
+
+**12 条状态转换全部 OK**（无卡死风险），但有 **7 个边缘 case**。
+
+### 修复 1：ASK_USER 状态也存（避免 ctrl+c 丢工作）
+
+```python
+# 在 state handler 切换时
+async def _enter_ask_user(ctx, question):
+    ctx.state = State.ASK_USER
+    ctx.pending_question = question
+    ctx.append_reasoning(f"[ASK_USER] 进入，问题: {question}")
+    # ✅ 修复 1：进入 ASK_USER 时立即 save
+    save_context_to_sqlite(ctx, db)  # 捕获 pending_question
+
+async def _exit_ask_user(ctx, user_reply):
+    ctx.pending_question = None
+    ctx.user_replies.append(user_reply)
+    # ✅ 修复 1：退出 ASK_USER 时也 save
+    save_context_to_sqlite(ctx, db)
+```
+
+**避免**：用户 ctrl+c 期间 pending_question 丢失。
+
+### 修复 2：工具被 reject 后显式注入 disabled list
+
+```python
+def _assemble_prompt(ctx, tools):
+    sections = [...]
+    
+    # ✅ 修复 2：disabled_tools 显式注入
+    if ctx.disabled_tools:
+        disabled_section = "## ⚠️ 已禁用工具（请不要调）\n"
+        disabled_section += "\n".join(f"- `{t}`" for t in ctx.disabled_tools)
+        sections.append(disabled_section)
+    
+    return "\n\n".join(sections)
+```
+
+**避免**：LLM 调 disabled 工具导致反复失败。
+
+### 修复 3：INTAKE 严重失败直接 EXIT
+
+```python
+async def _intake(ctx, raw_input, llm):
+    if not raw_input or not raw_input.strip():
+        # ✅ 修复 3：空输入直接 EXIT
+        ctx.state = State.EXIT
+        ctx.error = "Empty input"
+        return
+    
+    try:
+        # 正常解析
+        ctx.problem = parse(raw_input)
+        ctx.state = State.INVESTIGATE
+    except Exception as e:
+        # ✅ 修复 3：解析彻底失败也 EXIT（不浪费 8 轮空跑）
+        ctx.state = State.EXIT
+        ctx.error = f"Parse failed: {e}"
+```
+
+**避免**：空 / 无效输入浪费 8 轮 iteration。
+
+### 修复 4：MAX_ITERATIONS / Compaction LLM 失败兜底
+
+```python
+async def _force_max_iter_summary(ctx, llm):
+    """MAX_ITERATIONS 强制总结，LLM 失败用 last judgment 兜底"""
+    try:
+        response = await llm.stream(MAX_ITERATIONS_PROMPT, tools=[])
+        ctx.final_output = response.text
+    except Exception as e:
+        # ✅ 修复 4：LLM 失败兜底
+        ctx.append_reasoning(f"[MAX_ITERATIONS] 强制总结 LLM 失败: {e}")
+        ctx.append_reasoning(f"[FALLBACK] 用 last judgment 兜底")
+        ctx.final_output = _format_judgment_fallback(ctx)
+    ctx.state = State.CONCLUDE
+
+
+def _format_judgment_fallback(ctx) -> str:
+    """LLM 不可用时的兜底输出"""
+    judgment = ctx.current_judgment
+    if judgment.category == "UNKNOWN":
+        return "Agent 未能形成结论（异常退出）"
+    
+    lines = [
+        f"## 尽力而为的判断",
+        f"",
+        f"**类别**: {judgment.category}",
+        f"**置信度**: {judgment.confidence:.2f}",
+        f"**理由**: {judgment.one_line_reason}",
+        f"",
+        f"## 已知证据（{len(ctx.evidence)} 条）",
+    ]
+    for i, ev in enumerate(ctx.evidence[:5], 1):
+        lines.append(f"{i}. [{ev.source}] {ev.location}")
+    
+    lines.extend([
+        f"",
+        f"⚠️ *（MAX_ITERATIONS 强制总结时 LLM 不可用，本输出为兜底）*",
+    ])
+    return "\n".join(lines)
+
+
+async def _trigger_compaction(ctx, llm):
+    """Compaction 触发，PRUNE + SUMMARY"""
+    # Step 1: PRUNE（不调 LLM，必成功）
+    pruned = await prune_old_tool_outputs(ctx)
+    
+    # Step 2: SUMMARY（调 LLM）
+    try:
+        new_summary = await llm.summarize(
+            previous_summary=ctx.compactions[-1].summary if ctx.compactions else None,
+            template=SUMMARY_TEMPLATE,
+        )
+    except Exception as e:
+        # ✅ 修复 4：SUMMARY 失败用 truncated fallback
+        ctx.append_reasoning(f"[COMPACTION] SUMMARY 失败: {e}, 用 truncated fallback")
+        new_summary = _truncated_fallback_summary(ctx)
+    
+    record = CompactionRecord(
+        summary=new_summary,
+        pruned_count=pruned,
+    )
+    ctx.compactions.append(record)
+
+
+def _truncated_fallback_summary(ctx) -> str:
+    """LLM summarization 失败时，简单截取 evidence 标题"""
+    lines = ["## 压缩摘要 (truncated fallback)"]
+    for ev in ctx.evidence[-10:]:  # 最近 10 条
+        if not ev.compacted:
+            lines.append(f"- [{ev.source}] {ev.location}: {ev.content[:50]}...")
+    return "\n".join(lines)
+```
+
+**避免**：LLM 不可用 → 整个流程死锁。
+
+### 接受的 3 个边缘 case
+
+**接受 1：EXIT 状态输出格式** —— Phase 1+ 补，Phase 0 用简单文本。
+
+**接受 2：Compaction 自身 LLM 失败** —— 已用 truncated fallback 兜底（修复 4）。
+
+**接受 3：连续 doom loop** —— 信任用户，OpenCode 模式，reasoning_trace 记录。
+
+### 完整状态转换表（**修订版**）
+
+| From | Event | To | 备注 |
+|---|---|---|---|
+| (start) | input | INTAKE | 正常入口 |
+| (start) | empty input | **EXIT** | **修复 3**：空输入不空跑 |
+| INTAKE | parse ok | INVESTIGATE | 正常 |
+| INTAKE | parse fail | INVESTIGATE（degraded）| 仍继续（Problem 不全）|
+| INTAKE | fatal error | **EXIT** | **修复 3**：连 raw_input 都没有 |
+| INVESTIGATE | `conclude` event | CONCLUDE | 正常 |
+| INVESTIGATE | `ask_user` event | ASK_USER | 正常 |
+| INVESTIGATE | `tool_call` events | INVESTIGATE（continue）| 并行执行 |
+| INVESTIGATE | doom loop | ASK_USER | 修复：弹窗等用户 |
+| INVESTIGATE | overflow | compaction → INVESTIGATE | 修复 4：失败兜底 |
+| INVESTIGATE | max_iter | CONCLUDE | 修复 4：LLM 失败用 judgment 兜底 |
+| **ASK_USER enter** | — | **(SAVE)** | **修复 1**：存 pending_question |
+| ASK_USER | user reply | INVESTIGATE（+ SAVE）| 正常 + 存 user_reply |
+| ASK_USER | ctrl+c | (session paused) | 状态保持 ASK_USER |
+| ASK_USER | user types `exit` | CONCLUDE | 用户主动结束 |
+| CONCLUDE | format done | EXIT | 正常 |
+| (any) | fatal_error | EXIT | 兜底 |
+
+**结论**：12 + 7 = **19 条转换全部明确，无卡死风险**。
+
+### 修复影响的 SPEC.md 章节
+
+接下来写 SPEC.md 时，**这 4 个修复直接落到对应模块**：
+- 修复 1 → REPL 模块 / Persistence 模块
+- 修复 2 → Context 模块（prompt 装配）
+- 修复 3 → State machine 模块（INTAKE handler）
+- 修复 4 → Loop 模块（MAX_ITERATIONS / Compaction）
