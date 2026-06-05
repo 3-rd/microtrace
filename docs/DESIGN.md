@@ -1265,6 +1265,33 @@ microtrace> /judgment
 - 如果觉得 history 啰嗦，可以加 `/judgment clear` 命令手动清
 - 或者只保留最近 N 次（但默认不砍，保留全量）
 
+#### Q3.5: history 进 LLM context 吗？✅ **已决定 → 不进**
+
+**决定**（老板 2026-06-05）：**LLM 不感知 judgment history**
+
+**理由**：
+- LLM 每轮做的是"**现在**该判什么"，不需要"我之前判过啥"
+- 看 history 反而**引入确认偏倚**——LLM 倾向"维持一致"或"刻意不同"
+- transition 已被 `reasoning_trace` 捕获（"判断更新 #3: A→B, 0.70→0.82"）
+- 8 条 × 200 字 ≈ 12.8K token 浪费（VNFM 调查 evidence 已重）
+- 跟 OpenCode 保持一致
+
+**数据流**：
+
+```
+工具调用 / 推理
+    ↓
+LLM 输出 judgment_update
+    ↓
+update_judgment()
+    ├─→ ctx.current_judgment = new（覆盖）──→ 喂 LLM
+    └─→ ctx.judgment_history.append(new)（追加）──→ 只给 REPL
+    ↓
+build_prompt() 只放 current_judgment
+```
+
+**例外**：如果未来 LLM 真要"回看"（Phase 1+），可以加 `/trace` 工具让它主动读 history。**Phase 0 不实现**（YAGNI）。
+
 ### Q4. max_iterations = 8？
 **修订**：max_iterations **= 8**（主）+ **compaction 触发**（避免提前达上限）
 - 选项 A：固定 8
