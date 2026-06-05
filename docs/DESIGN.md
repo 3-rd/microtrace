@@ -1930,10 +1930,92 @@ async def compact(ctx, llm, db):
 | compaction summary | Anchored | OpenCode 通用（累积更新）|
 | judgment_history | 存不压，**不进 LLM** | microtrace 独有（debug 元数据）|
 
-### Q9. **新增** Compaction 触发阈值：buffer = 20K？
-- A）固定 20K（**当前倾向，与 OpenCode 一致**）
-- B）动态调整（按模型 context 比例）
-- C）可配置（用户改）
+### Q9. Compaction 触发阈值 ✅ **已决定 → 固定 20K（与 OpenCode 一致）**
+
+**决定**（老板 2026-06-05）："先对齐 opencode"
+
+#### Q9a buffer 大小：**固定 20K**
+
+**OpenCode 实际**（`src/session/overflow.ts`）：
+```typescript
+const COMPACTION_BUFFER = 20_000  // 固定 20K
+```
+
+**为什么是 20K（不算大不算小）**：
+- 8K 模型：太大（但 Phase 0 不用 8K）—— 用 32K+
+- 32K 模型：20K 留 12K 给 evidence——**够 8 轮**
+- 128K 模型：20K 留 108K——**极够**
+
+**20K 用途拆解**：
+- summary 输出：1-2K
+- 未来 1-2 轮 evidence 增量：1-2K
+- system + tools + problem + judgment：3-5K
+- 估算误差 buffer：5-10K
+- **加起来正好 20K**
+
+#### Q9b 触发判定：tokens >= context_window - 20K
+
+```python
+COMPACTION_BUFFER = 20_000
+
+def check_overflow(ctx, model):
+    estimated_total = ctx.cumulative_tokens + ctx.estimated_prompt_tokens
+    usable = model.context_window - COMPACTION_BUFFER
+    return estimated_total >= usable
+```
+
+**为什么不 80% / 90% 触发**：
+- context_window 不是统一的（不同模型 8K ~ 200K）
+- 固定 20K 留出来**跟模型无关**
+- 实测 OpenCode 跑了一年没问题
+
+#### Q9c 可配置：**Phase 0 hardcoded + config 留位置**
+
+**OpenCode 做法**：
+- 默认 20K hardcoded
+- 高级用户改 `cfg.compaction.reserved`（config.yaml）
+
+**我们的对应**：
+- ✅ Phase 0 default = 20K（hardcoded）
+- ✅ config.yaml 留 `compaction.buffer` 字段位置（不实现，YAGNI 钩子）
+- ✅ 未来需要时启用
+
+```yaml
+# ~/.config/microtrace/config.yaml
+compaction:
+  buffer: 20000  # 留 20K 给 summary + 增量 + 误差
+```
+
+**预留钩子代码**：
+
+```python
+def get_compaction_buffer(model: Model) -> int:
+    """Phase 0: hardcoded 20K; 未来从 config 读"""
+    # 钩子位置，未来启用：
+    # cfg = load_config()
+    # if cfg.compaction and cfg.compaction.buffer:
+    #     return cfg.compaction.buffer
+    return 20_000
+```
+
+#### 为什么不 B（动态比例）
+
+- 实测 OpenCode 没这么做
+- 动态比例需要 model 注册额外字段
+- 固定 20K 简单稳定，**与 OpenCode 对齐降低不确定性**
+
+#### 为什么不 C（用户可配）
+
+- Phase 0 YAGNI
+- 大多数用户不知道 buffer 是什么
+- 真出问题再说
+
+#### 未来调整
+
+- 跑 30-50 个真实样本后看 compaction 频率
+- 如果 20K 触发太频繁 → 考虑降到 15K
+- 如果 20K 触发太晚（context 爆了）→ 考虑升到 25K
+- **默认不动**
 
 ### Q10. **新增** Doom Loop 触发后行为？
 - A）进入 ASK_USER 弹窗（**当前倾向**）
