@@ -2385,15 +2385,204 @@ async def call_with_retry(llm_func, *args, max_retries=5):
 
 ---
 
-## 附录：OpenCode 技术栈一览
+## 12. 跨平台（Windows）支持 ✅ **已决定**
 
-| 组件 | OpenCode | microtrace |
+**决定**（老板 2026-06-05）：
+> "在原型阶段，我还是希望它能够跑在 Windows 上的，因为公司内部的办公电脑是 Windows"
+
+#### 路径处理：`platformdirs`（**加依赖**）
+
+```python
+# 之前（XDG only，Windows 不对）
+config_path = Path.home() / ".config" / "microtrace" / "config.yaml"
+data_path = Path.home() / ".local" / "microtrace"
+
+# 之后（跨平台）
+from platformdirs import user_config_dir, user_data_dir
+config_path = Path(user_config_dir("microtrace")) / "config.yaml"
+data_path = Path(user_data_dir("microtrace"))
+```
+
+**自动映射**：
+- Linux: `~/.config/microtrace/` / `~/.local/share/microtrace/`
+- macOS: `~/Library/Application Support/microtrace/` / `~/Library/Application Support/microtrace/`
+- Windows: `%APPDATA%\microtrace\` / `%LOCALAPPDATA%\microtrace\`
+
+**新增依赖**：
+```toml
+dependencies = [
+    ...
+    "platformdirs>=4.0",  # 跨平台路径
+]
+```
+
+#### Python 版本要求：**3.11+**
+
+| 版本 | 优点 | 缺点 |
 |---|---|---|
-| Runtime | Bun (TypeScript) | Python 3.11 |
-| LLM 客户端 | Vercel AI SDK | MiniMax SDK + 抽象接口 |
-| 流式 LLM | Effect.Stream | asyncio + AsyncIterator |
-| 事件溯源 | 25+ 事件类型 | 10 个左右（简化） |
-| HTTP | Hono | FastAPI |
-| TUI | Go + Bubble Tea | prompt_toolkit |
-| 状态持久化 | SQLite | 轻量 JSON（Phase 0）|
-| Snapshot | ZFS-like | ❌ 不做 |
+| **3.11+（**锁定**）** | tomllib / 更好的错误信息 / 类型注解改进 / 性能 | 旧 Windows 默认 3.9 |
+| 3.10+ | 兼容更广 | 缺 tomllib |
+| 3.9+ | 最广 | 缺很多新特性 |
+
+**3.11 是 sweet spot**——tomllib 重要（**配置可以考虑 TOML**），错误信息改进 debug 友好。
+
+#### Windows console 兼容
+
+**prompt_toolkit 在 Windows 上的行为**：
+
+```python
+# src/microtrace/repl/main.py
+import sys
+import os
+
+def _setup_windows_console():
+    """Windows console 兼容性处理"""
+    if sys.platform != "win32":
+        return
+    
+    # 1. 强制 UTF-8（中文系统默认 GBK）
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdin.reconfigure(encoding="utf-8")
+    
+    # 2. 启用虚拟终端序列（Win10 1607+）
+    os.environ["TERM"] = "xterm-256color"
+    
+    # 3. 检测 legacy console，自动降级无颜色
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        # legacy console → 降级
+        os.environ["NO_COLOR"] = "1"
+        os.environ["TERM"] = "dumb"
+```
+
+**REPL 启动时调用**（一次即可）。
+
+#### 路径拼接硬规则
+
+```python
+# ✅ 强制规则
+from pathlib import Path
+
+# ✅ 正确
+path = Path("~/config") / "microtrace" / "config.yaml"
+path = Path(user_config_dir("microtrace")) / "config.yaml"
+
+# ❌ 禁止（Windows 上变成 "C:\Users\xxx\~/config/..."）
+path_str = f"~/config/microtrace/{filename}"
+```
+
+**SPEC.md 加 linter 规则**（Phase 1+ 启用 ruff 时）：
+- `flake8-use-pathlib` 等规则
+- 或 code review 强制
+
+#### 测试策略
+
+**Phase 0**：
+- 主开发：Mac（老板本机）
+- **Windows 验证**：写完核心功能后**手动在 Windows 跑一遍**（老板公司电脑）
+- 重点验证：
+  - `pip install -e .` 顺利
+  - REPL 启动 + 中文输入不乱码
+  - 配置文件读写
+  - SQLite DB 创建在 `%LOCALAPPDATA%\microtrace\`
+  - 4 个工具的 Windows 路径处理
+
+**Phase 1+**：
+- CI matrix（Mac / Windows / Linux）
+- 自动化跨平台测试
+
+#### 完整 Windows 兼容清单
+
+| 功能 | Windows | 备注 |
+|---|---|---|
+| Python 启动 | ✅ | 3.11+ from python.org |
+| `pip install -e .` | ✅ | 装好依赖即可 |
+| REPL 启动 | ✅ | 旧 console 降级无颜色 |
+| 中文输入/输出 | ✅ | 强制 UTF-8 |
+| 文件路径 | ✅ | `platformdirs` + `pathlib` |
+| Config 读写 | ✅ | YAML 跨平台 |
+| SQLite | ✅ | Python 自带 |
+| FastAPI 启动 | ✅ | 跨平台 |
+| Rich 渲染 | ✅ | v13+ 支持好 |
+| prompt_toolkit | ✅ | Windows 兼容 |
+| Typer CLI | ✅ | 跨平台 |
+
+**预计** Phase 0 在 Windows 上**应该跑得起来**，前提是**手动验证一遍**。
+
+#### 风险点（明列）
+
+1. **prompt_toolkit 在某些 Windows 配置下行为诡异**
+   - 风险等级：低（v3+ 已成熟）
+   - 缓解：REPL 启动时检测 + 降级
+
+2. **公司 Windows 可能装的是 PowerShell ISE（极老）**
+   - 风险等级：中
+   - 缓解：检测 + 提示用 PowerShell 7+ 或 Windows Terminal
+
+3. **公司 Windows 可能没有 Python 3.11+**
+   - 风险等级：低
+   - 缓解：提供安装说明（`winget install Python.Python.3.11` 或 python.org 下载）
+
+#### 实际安装步骤（Windows）
+
+```powershell
+# 1. 安装 Python 3.11+（如果还没装）
+winget install Python.Python.3.11
+
+# 2. 验证 Python
+python --version  # 应显示 3.11.x
+
+# 3. 克隆 microtrace
+git clone https://github.com/3-rd/microtrace.git
+cd microtrace
+
+# 4. 安装（开发模式）
+pip install -e .
+
+# 5. 跑！
+microtrace
+```
+
+---
+
+## 附录：microtrace 技术栈（终版）
+
+## 附录：microtrace 技术栈（终版，2026-06-05 锁定）
+
+| 类别 | 选择 | 备注 |
+|---|---|---|
+| **语言** | **Python 3.11+** | 老板定，**Windows 兼容** |
+| **LLM SDK** | **OpenAI Python SDK** | MiniMax 兼容 OpenAI 协议（改 `base_url`）|
+| **数据验证** | **Pydantic v2** | 工具输入严格验证 |
+| **HTTP** | **FastAPI** | VISION 已定 |
+| **REPL** | **prompt_toolkit** | VISION 已定 |
+| **CLI** | **Typer** | 基于 Click + Pydantic |
+| **DB** | **stdlib sqlite3** | Q6 已定 |
+| **路径** | **platformdirs** | 跨平台 XDG / AppData |
+| **配置** | **YAML**（PyYAML）| `~/.config/microtrace/config.yaml` |
+| **异步** | **asyncio**（stdlib）| 无选择 |
+| **测试** | **pytest** | DESIGN 已定 |
+| **项目结构** | **src/ 布局 + pyproject.toml**（PEP 621）| 不引入 poetry |
+| **Type checking** | ❌ 推迟（YAGNI）| 写 type hints 即可 |
+| **Linting** | ❌ 推迟（YAGNI）| Phase 1+ 再加 ruff |
+| **CI/CD** | ❌ 推迟 | 不上 |
+
+**pyproject.toml 运行时依赖**（8 个）：
+```toml
+[project]
+dependencies = [
+    "openai>=1.0",           # LLM SDK
+    "pydantic>=2.0",         # 数据验证
+    "fastapi>=0.100",        # HTTP
+    "uvicorn>=0.20",         # ASGI server
+    "prompt-toolkit>=3.0",   # REPL
+    "typer>=0.9",           # CLI
+    "rich>=13.0",            # REPL 渲染
+    "pyyaml>=6.0",           # 配置
+    "platformdirs>=4.0",     # 跨平台路径
+]
+```
