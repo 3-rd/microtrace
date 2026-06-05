@@ -2017,12 +2017,158 @@ def get_compaction_buffer(model: Model) -> int:
 - 如果 20K 触发太晚（context 爆了）→ 考虑升到 25K
 - **默认不动**
 
-### Q10. **新增** Doom Loop 触发后行为？
-- A）进入 ASK_USER 弹窗（**当前倾向**）
-- B）自动终止本轮
-- C）自动换工具重试
+### Q10. Doom Loop 触发后行为 ✅ **已决定 → ASK_USER 弹窗（与 OpenCode 一致）**
 
-**当前倾向**：A（让用户决策，最安全）
+**决定**（老板 2026-06-05）："对齐 opencode 的吧"
+
+#### Q10a 触发后行为：ASK_USER 弹窗
+
+**OpenCode 实际**（`src/agent/agent.ts:98`）：
+```typescript
+doom_loop: "ask"  // ← 默认"询问"
+```
+
+**OpenCode 弹窗内容**（`src/cli/cmd/tui/routes/session/permission.tsx`）：
+```typescript
+if (permission === "doom_loop") {
+    return {
+        icon: "⟳",
+        title: "Continue after repeated failures",
+        body: "This keeps the session running despite repeated failures."
+    }
+}
+```
+
+**3 个标准选项**（`PermissionOption`）：
+- `once` - 允许这一次
+- `always` - 整个 session 都允许
+- `reject` - 拒绝
+
+#### Q10b 弹窗内容设计
+
+**我们的 REPL 弹窗**（借鉴 OpenCode + Q2 多选+自定义）：
+
+```
+╭─ ⚠️ microtrace · Doom Loop (3 次) ────────────────╮
+│  工具: find_class                                   │
+│  输入: {"class_name": "UserService"}               │
+│  最近结果: 找到 UserService.java                      │
+│                                                    │
+│  Agent 连续 3 次以相同参数调用此工具。               │
+│  你想怎么办？                                       │
+│                                                    │
+│  [1] 继续调用（这次允许）                           │
+│  [2] 总是允许（整个 session 不再问）                │
+│  [3] 拒绝（不再调这个工具）                          │
+│  [4] 自定义...                                      │
+╰────────────────────────────────────────────────────╯
+
+microtrace>
+```
+
+**3 个标准选项**（**OpenCode 模式**）：
+| 选项 | 含义 | 后续行为 |
+|---|---|---|
+| `once` | 这一次允许 | LLM 再调一次，再触发就再问 |
+| `always` | 整个 session 允许 | LLM 调任意次，不再问 |
+| `reject` | 拒绝 | 这个工具被禁用，agent 必须换思路 |
+
+**`custom` 兜底**（Q2 已定多选+自定义）：用户可以输入具体指令。
+
+#### Q10c 选项含义
+
+| 选项 | 适用场景 |
+|---|---|
+| **继续（once）** | "agent 这次判断是对的，再试一次" |
+| **总是允许（always）** | "我信任这个工具，让 agent 自己跑" |
+| **拒绝（reject）** | "agent 卡死了，让它换思路" |
+| **自定义** | "调用时改个参数" / "改用别的工具" / "停了我来" |
+
+#### 触发后代码行为
+
+```python
+async def handle_doom_loop(ctx, llm):
+    """Doom Loop 触发后，弹窗等用户决策"""
+    last_call = ctx.tool_history[-1]
+    
+    # 1. 进入 ASK_USER 态（Q1 硬阻塞 + Q2 多选+自定义）
+    ctx.state = State.ASK_USER
+    ctx.pending_question = QuestionPrompt(
+        header="Doom Loop",
+        question=f"工具 {last_call.name} 连续 3 次以相同参数调用。继续怎么办？",
+        options=[
+            Option(label="继续", description="这一次允许"),
+            Option(label="总是允许", description="整个 session 不再问"),
+            Option(label="拒绝", description="禁用此工具"),
+        ],
+        multiple=False,
+        custom=True,
+    )
+    
+    # 2. 等待用户回复（Q1 硬阻塞）
+    answer = await wait_for_user_reply()
+    
+    # 3. 处理回复
+    if answer == "继续" or answer == "once":
+        # 清空 doom_loop 标记，让 LLM 再调一次
+        ctx.doom_loop_tool = None
+        ctx.doom_loop_args = None
+        # 回到 INVESTIGATE 继续
+        ctx.state = State.INVESTIGATE
+    elif answer == "总是允许" or answer == "always":
+        # 标记为"本 session 内不再问"
+        ctx.allowed_tools.add(last_call.name)
+        ctx.doom_loop_tool = None
+        ctx.doom_loop_args = None
+        ctx.state = State.INVESTIGATE
+    elif answer == "拒绝" or answer == "reject":
+        # 标记为禁用
+        ctx.disabled_tools.add(last_call.name)
+        ctx.state = State.INVESTIGATE
+        # 下一轮 LLM 看到这个工具不可用
+    else:  # 自定义
+        # 解析用户输入，可能是新参数或新指令
+        parse_custom_input(answer, ctx)
+        ctx.state = State.INVESTIGATE
+```
+
+#### 跟 OpenCode 对齐细节
+
+| 维度 | OpenCode | microtrace |
+|---|---|---|
+| 触发 | 3 次精确匹配 | **3 次精确匹配**（一致）|
+| 默认行为 | `permission.ask` 弹窗 | **ASK_USER 弹窗**（一致）|
+| 选项 | `once` / `always` / `reject` | **3 选项 + custom**（一致 + 我们 Q2 加 custom）|
+| UI 位置 | TUI 顶部 | **REPL banner**（CLI 适配）|
+| 标题 | "Continue after repeated failures" | **"Doom Loop (3 次)"**（更明确）|
+| Body | "This keeps the session running despite repeated failures." | **"Agent 连续 3 次以相同参数调用此工具"**（更具体）|
+
+#### 为什么不 B（自动终止）
+
+- 用户**不知道**为什么 agent 停了
+- 输出不完整结论
+- **违背"严谨推理"必杀技**——agent 应该承认卡了，让用户介入
+
+#### 为什么不 C（自动换工具）
+
+- agent 已经卡了——**自己换 = 继续猜**
+- 严谨推理要求"有证据"——猜的结论**没证据**
+- **让人介入 = 让有上下文的工程师决策**
+
+#### 跟 Q1 硬阻塞一致
+
+Doom Loop 触发的 ASK_USER **复用 Q1 的硬阻塞机制**：
+- 同样的多选+自定义 UI
+- 同样的 REPL banner
+- 同样的 `ctrl+c` 退出
+- 同样的 `skip` 选项（**skip 含义是"doom_loop 拒绝，禁用此工具"**）
+
+#### 未来调整
+
+- 30-50 个真实样本后看 doom_loop 频率
+- 如果 doom_loop 频繁触发 → 调高阈值（5 次）
+- 如果 doom_loop 太少被错过 → 调低（2 次）
+- **默认不动**
 
 ### Q11. **新增** Retry 次数？
 - A）固定 3 次（**当前倾向**）
