@@ -1292,13 +1292,74 @@ build_prompt() 只放 current_judgment
 
 **例外**：如果未来 LLM 真要"回看"（Phase 1+），可以加 `/trace` 工具让它主动读 history。**Phase 0 不实现**（YAGNI）。
 
-### Q4. max_iterations = 8？
-**修订**：max_iterations **= 8**（主）+ **compaction 触发**（避免提前达上限）
-- 选项 A：固定 8
-- 选项 B：可配置（默认 8）
-- 选项 C：LLM 动态请求延长
+### Q4. max_iterations：固定上限 + 可配置 ✅ **已决定**
 
-**当前倾向**：B（可配置），因为 VNFM 复杂度差异大
+**决定**（老板 2026-06-05）：
+- **固定上限**（默认 8，**不跟 OpenCode 的 Infinity**）
+- **通过配置文件可配**（不是硬编码）
+- **达上限行为跟 OpenCode 保持一致**（注入 MAX_ITERATIONS prompt，强制 LLM 总结）
+
+**为什么不选 Infinity**（OpenCode 模式）：
+- Phase 0 agent 还不强，**固定上限是安全网**
+- VNFM 调查有界（3-8 轮就够），不像代码编辑需要 30-50 步
+- OpenCode 选 Infinity 是因为它有 **Doom Loop + Compaction + Question + Permission** 多重保护
+- 我们保护没那么多，固定上限兜底
+- **未来观察 1-2 个月**，看 agent 是否"经常到 8 轮还在干有价值的工作"——是的话升到 12
+
+**配置**：
+
+```yaml
+# ~/.config/microtrace/config.yaml
+agent:
+  max_iterations: 8  # 默认 8，可改
+```
+
+**CLI 改**：
+```bash
+microtrace config set max_iterations 12
+```
+
+**达上限行为**（跟 OpenCode 一致）：
+
+```python
+# Loop 主逻辑末尾
+if ctx.iteration >= ctx.max_iterations:
+    # 不 break，注入 MAX_ITERATIONS 提示，强制 LLM 总结
+    forced_prompt = _build_forced_summary_prompt(ctx)
+    # 注意：tools=[] 禁止任何工具调用
+    response = await llm.stream(forced_prompt, tools=[])
+    ctx.final_output = response.text
+    ctx.append_reasoning("[MAX_ITERATIONS] 强制总结，无工具调用")
+    # 进入 CONCLUDE 态
+```
+
+**MAX_ITERATIONS prompt**（仿 OpenCode `max-steps.txt`）：
+
+```markdown
+CRITICAL - MAXIMUM ITERATIONS REACHED
+
+The maximum number of iterations (8) for this investigation has been reached.
+Tool calls are disabled. You MUST respond with text only.
+
+Required content:
+1. Statement that max iterations have been reached
+2. Summary of what has been investigated (with evidence references)
+3. Current best judgment (A/B/C) and reasoning
+4. List of what you could NOT verify (remaining gaps)
+5. Recommendation for what should be investigated next
+
+DO NOT make any tool calls. Text only.
+```
+
+**为什么不 hard break**（粗暴结束）：
+- 用户拿到"尽力而为的答案 + 明确的未完成项" > 拿到"什么都没"
+- 强制总结把已知 evidence 沉淀下来
+- 比"无声失败"好得多
+
+**未来调整**：
+- 跑 30-50 个真实样本后重新评估
+- 如果 agent 经常"8 轮卡在有价值的工作上" → 改默认到 12
+- 如果 compaction 验证稳定 → 考虑 12 或 15
 
 ### Q5. evidence relevance：谁评？
 （不变）LLM 自评，倾向 A
