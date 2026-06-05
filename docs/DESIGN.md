@@ -1423,13 +1423,112 @@ class Evidence:
 - Compaction 时按 `importance` 决定保留（critical 不压）
 - 截取时按 `relevance` 选 top-N
 
-### Q6. Session 持久化？
-**新增选项**：
-- A）Phase 0 不做（每次新 session）
-- B）轻量 JSON（`~/.microtrace/sessions/<id>.json`）
-- C）完整持久化（SQLite）
+### Q6. Session 持久化 ✅ **已决定 → SQLite + 每轮存 + 命令 resume**
 
-**当前倾向**：B（轻量 JSON），Phase 0 增量
+**决定**（老板 2026-06-05）："都按你推荐来"
+
+#### Q6a 存储后端：SQLite（标准库 `sqlite3`）
+
+**为什么 SQLite**（之前我推荐 JSON 错了，修正）：
+- Python 标准库自带 `sqlite3`，**0 依赖**
+- 单文件 `~/.local/share/microtrace/state.db`
+- 自动创建表结构
+- 事务安全（崩溃不损坏）
+- **用户感知不到"数据库"**——跟 Photos.app / Notes.app 一样
+
+**OpenCode 用 SQLite 是真的最简方案**，不是"规模大了才上"。
+
+#### Q6b 保存时机：每轮 iteration 存
+
+```python
+# Loop 主逻辑
+while ctx.iteration <= ctx.max_iterations:
+    # 1. LLM call + tool execution + judgment update
+    # 2. 一轮结束，存一次
+    save_context_to_sqlite(ctx, db)
+```
+
+**保存粒度对比**：
+
+| 方案 | I/O 次数/session | 数据丢失风险 |
+|---|---|---|
+| 每个 event 存（OpenCode 全量）| 30-50 | 几乎 0 |
+| **每轮 iteration 存（**我推荐**）** | **8** | **最多 1 轮** |
+| 只在 CONCLUDE 存 | 1 | 中途崩 = 全部白费 |
+
+**为什么是 iteration 不是 event**：
+- 我们 agent 简单（4 工具，3 态），8 轮 8 次 I/O 足够
+- 不像 OpenCode 一次对话几十个 event
+- 8 毫秒级 I/O，可接受
+- 跟 OpenCode "不丢有价值工作" 的精神一致
+
+#### Q6c Resume 机制：`microtrace resume <session_id>`
+
+```bash
+$ microtrace
+> New session started
+> Session ID: 2026-06-05-163000-npe-userservice
+
+$ microtrace sessions
+ID                                       Status        Updated
+2026-06-05-163000-npe-userservice        in_progress   5min ago
+2026-06-05-100230-bug-validation         completed     3h ago
+
+$ microtrace resume 2026-06-05-163000-npe-userservice
+> Resuming session 2026-06-05-163000-npe-userservice
+> Loaded context: iter 3/8, 5 evidence, judgment=B (0.75)
+> [REPL starts where you left off]
+```
+
+**session id 怎么取**：
+- 启动时 REPL 显示
+- `microtrace sessions` 列表查
+- **不自动恢复最近一个**（避免混淆多事故）
+
+**Abandoned 状态**：
+- ctrl+c 时如果没完成 → 标 `abandoned`
+- abandoned 也能 `resume`（不是"坏的"）
+- Phase 1+ 可以加自动清理
+
+#### Q6d Schema：整个 Context 一个 JSON 列
+
+```sql
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  status TEXT NOT NULL,  -- 'in_progress' / 'completed' / 'abandoned'
+  title TEXT,
+  context_json TEXT NOT NULL  -- 整个 Context 序列化
+);
+
+CREATE INDEX idx_sessions_status ON sessions(status);
+CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC);
+```
+
+**为什么不拆 events / judgments / evidence 表**：
+- Phase 0 不需要 SQL 查询"所有 B 类 judgment"
+- JSON 一次读写 = 一次 SQL 操作
+- Schema 简单 = 不容易出错
+
+**未来要拆**（学 OpenCode）：
+- 写迁移脚本"从 context_json 拆 events / judgments / evidence"
+- OpenCode Migration 2 给完整范本
+
+#### 关键 UX：**用户感知不到数据库**
+
+启动时：
+- 自动在 `~/.local/share/microtrace/state.db` 创建 DB
+- 用户只看到 "New session started" 的提示
+- 不需要任何"连接数据库"操作
+- 失败是文件 I/O 错误，不是"DB 连不上"
+
+管理命令：
+- `microtrace sessions` —— 列表
+- `microtrace resume <id>` —— 恢复
+- `microtrace delete <id>` —— 删除（Phase 1+）
+
+清理：直接 `rm` 那个 .db 文件（**真·零运维**）
 
 ### Q7. tool_call 并行？
 **修订**：**默认并行**（OpenCode 模式）
