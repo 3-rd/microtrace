@@ -2170,10 +2170,218 @@ Doom Loop 触发的 ASK_USER **复用 Q1 的硬阻塞机制**：
 - 如果 doom_loop 太少被错过 → 调低（2 次）
 - **默认不动**
 
-### Q11. **新增** Retry 次数？
-- A）固定 3 次（**当前倾向**）
-- B）固定 5 次
-- C）可配置
+### Q11. Retry 策略 ✅ **已决定 → 固定 5 次 + 指数退避 + transient-only**
+
+**决定**（老板 2026-06-05）："按你推荐来"
+
+#### Q11a retry 次数：**固定 5 次**
+
+| 选项 | 次数 | 总等待 | 推荐度 |
+|---|---|---|---|
+| A 固定 3 | 3 | 14s | 限流恢复可能不够 |
+| **B 固定 5（**锁定**）** | **5** | **62s** | **够等一次限流恢复** |
+| C 跟 OpenCode 无限 | 无限 | 无限 | CLI 不适合 |
+
+**为什么是 5 不是 3**：
+- 429 限流常 30-60s
+- 3 次 = 14s 总等待（**可能不够**）
+- 5 次 = 62s 总等待（**够等一次限流恢复**）
+- 10 次太慢，**5 次合理**
+
+**为什么不是 OpenCode 无限**：
+- OpenCode 跑在 server，session 重启成本低
+- 我们跑在 CLI terminal，**用户会以为"卡死"**
+- 5 次 62s = 可接受上限
+- 5 次还失败 = 真有问题，**别再试了**
+
+#### Q11b 退避策略：**指数退避 2s/4s/8s/16s/32s**
+
+**OpenCode 模式**（`src/session/retry.ts`）：
+```typescript
+RETRY_INITIAL_DELAY = 2000       // 2s
+RETRY_BACKOFF_FACTOR = 2         // 指数
+RETRY_MAX_DELAY_NO_HEADERS = 30_000  // 30s capped
+```
+
+**我们的对应**：
+```python
+RETRY_DELAYS = [2, 4, 8, 16, 32]  # 5 次重试，总等待 62s
+RETRY_MAX_DELAY = 30_000  # 单次最大 30s（防止单次等太久）
+```
+
+**单次 LLM 调用重试时间线**：
+```
+attempt 1: 调用（失败）
+  ↓ 等 2s
+attempt 2: 调用（失败）
+  ↓ 等 4s
+attempt 3: 调用（失败）
+  ↓ 等 8s
+attempt 4: 调用（失败）
+  ↓ 等 16s
+attempt 5: 调用（失败）
+  ↓ 放弃
+总等待：62s
+```
+
+**遵守 Retry-After header**（如果有）：
+```python
+if error.has_retry_after_header:
+    wait_ms = error.retry_after_ms
+else:
+    wait_ms = RETRY_DELAYS[attempt - 1] * 1000
+```
+
+#### Q11c 错误分类：**transient 重试，permanent 不重试**
+
+```python
+def is_retryable(error) -> bool:
+    """判断 error 是否值得重试"""
+    
+    # 不可重试：4xx 客户端错误，auth 问题
+    if isinstance(error, BadRequestError):  # 400
+        return False
+    if isinstance(error, AuthError):  # 401, 403
+        return False
+    if isinstance(error, NotFoundError):  # 404
+        return False
+    
+    # 可重试：网络 / 限流 / server error
+    if isinstance(error, NetworkError):
+        return True
+    if isinstance(error, RateLimitError):  # 429
+        return True
+    if isinstance(error, ServerError):  # 5xx
+        return True
+    if isinstance(error, TimeoutError):
+        return True
+    
+    # 默认不重试（保守）
+    return False
+```
+
+**关键**：**保守分类**——不确定就不重试。
+
+#### Retry 完整实现
+
+```python
+async def call_with_retry(llm_func, *args, max_retries=5):
+    last_error = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await llm_func(*args)
+        
+        except Exception as e:
+            last_error = e
+            
+            if not is_retryable(e):
+                # permanent error，不重试
+                raise PermanentError(f"non-retryable: {e}")
+            
+            if attempt == max_retries:
+                # 已达上限，放弃
+                raise RetryExhaustedError(
+                    f"max retries ({max_retries}) exceeded: {e}"
+                )
+            
+            # 决定等待时间
+            if hasattr(e, 'retry_after_ms') and e.retry_after_ms:
+                wait_ms = e.retry_after_ms
+            else:
+                wait_ms = RETRY_DELAYS[attempt - 1] * 1000
+            
+            ctx.append_reasoning(
+                f"[RETRY {attempt}/{max_retries}] {type(e).__name__}, "
+                f"等 {wait_ms/1000}s 后重试"
+            )
+            
+            await asyncio.sleep(wait_ms / 1000)
+    
+    # 不可能到这里，但为了类型安全
+    raise RetryExhaustedError(f"max retries: {last_error}")
+```
+
+#### 哪些场景用 retry
+
+| 场景 | 重试？ | 原因 |
+|---|---|---|
+| LLM stream 调用失败（5xx）| ✅ | transient |
+| LLM rate limit（429）| ✅ | transient，遵守 Retry-After |
+| LLM auth 失败（401）| ❌ | permanent，重试无意义 |
+| 工具执行失败（文件不存在）| ❌ | 业务错误，作为 evidence 给 LLM |
+| 工具超时 | ❌ | 上层决定（30s timeout）|
+| Compaction LLM 调用失败 | ✅ | transient（同 LLM retry）|
+| 网络断开 | ✅ | transient |
+
+**关键边界**：**工具错误不重试**——失败作为 evidence 喂给 LLM，让它决定怎么办。
+
+#### 可视化（REPL 显示）
+
+```
+[LLM 调用 iter 3] attempt 1/5
+  ↓ 失败 (RateLimitError 429, Retry-After: 30s)
+[RETRY 1/5] 等 30s 后重试
+[LLM 调用 iter 3] attempt 2/5
+  ↓ 失败 (RateLimitError 429, Retry-After: 30s)
+[RETRY 2/5] 等 30s 后重试
+[LLM 调用 iter 3] attempt 3/5
+  ↓ 成功
+[INVESTIGATE 继续]
+```
+
+#### 为什么不无限重试
+
+- **用户感知**：5 次 62s = 用户知道"还要再等一会"
+- 5 次后还失败 = **真有问题**（不是限流恢复那么简单）
+- **避免"卡死"**——CLI 用户的耐心有限
+- OpenCode 跑 server，**用户不直接等**——我们跑 CLI，**用户在等**
+
+#### 为什么不是固定间隔
+
+- 固定间隔（5s × 5 = 25s）——**不尊重 server 的 Retry-After**
+- server 限流恢复时间不固定
+- 指数退避 + 遵守 header = **最优策略**
+
+#### 跟 OpenCode 的一致性
+
+| 维度 | OpenCode | microtrace |
+|---|---|---|
+| 退避算法 | 指数 2x | **指数 2x**（一致）|
+| 初始延迟 | 2s | **2s**（一致）|
+| 最大延迟 | 30s | **30s**（一致）|
+| Retry-After header | ✅ | **✅**（一致）|
+| 硬 cap | ❌ 无限 | **5 次**（CLI 适配）|
+| Transient 分类 | ✅ | **✅**（一致）|
+
+**最大差异**：我们**有硬 cap**（5 次），OpenCode 没有。**这是 CLI vs Server 的本质差异**。
+
+#### 未来调整
+
+- 跑 30-50 样本后看 retry 频率
+- 如果 retry 太频繁（每次都重试）→ 调查 LLM client 配置
+- 如果 retry 后还是失败率高 → 降 cap 到 3
+- 如果 cap 太低（用户说"再试试"）→ 升到 8
+- **默认不动**
+
+---
+
+## 🎉 11 个开放问题全部锁定！
+
+| # | 问题 | 决策 |
+|---|---|---|
+| Q1 | ASK_USER 阻塞 | 硬阻塞 + 无超时 |
+| Q2 | ASK_USER 触发+护栏+UI | LLM 自决+Doom Loop / 纯 prompt / 多选+自定义 |
+| Q3 | judgment 历史 | 版本化（REPL 看）|
+| Q3.5 | history 进 LLM | 不进 |
+| Q4 | max_iterations | 固定 8 + 可配置 + 强制总结 |
+| Q5 | evidence relevance | LLM 自评 |
+| Q6 | Session 持久化 | SQLite + 每轮存 + 命令 resume |
+| Q7 | tool_call 并行 | 默认并行 + LLM 自判 + 错误隔离 |
+| Q8 | Compaction | OpenCode 共用 + microtrace 独有 |
+| Q9 | Compaction buffer | 固定 20K |
+| Q10 | Doom Loop 行为 | ASK_USER 弹窗 + once/always/reject/custom |
+| Q11 | Retry 策略 | 5 次 + 指数退避 + transient-only |
 
 ---
 
