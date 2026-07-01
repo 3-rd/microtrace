@@ -4,7 +4,8 @@ import time
 import tempfile
 import pytest
 from microtrace.context.models import (
-    Context, Problem, Judgment, Evidence, JudgmentCategory, EvidenceSource,
+    Context, Problem, Hypothesis, HypothesisSet, HypothesisStatus,
+    Evidence, JudgmentCategory, EvidenceSource,
 )
 from microtrace.persistence.sqlite import (
     init_db, save_context_to_sqlite, load_context_from_sqlite,
@@ -40,18 +41,25 @@ def test_save_and_load_roundtrip(tmp_db):
     original = Context(
         session_id="test-roundtrip",
         problem=Problem(raw_input="NPE at UserService.java:42", error_type="NPE"),
-        current_judgment=Judgment(
-            category=JudgmentCategory.A, confidence=0.85,
-            one_line_reason="looks like our bug", reasoning="evidence says so"
-        ),
     )
+    h = Hypothesis(
+        statement="looks like our bug",
+        category=JudgmentCategory.A,
+        confidence=0.85,
+        status=HypothesisStatus.CONFIRMED,
+    )
+    original.hypotheses.add(h)
+    original.hypotheses.confirm(h.id)
+
     save_context_to_sqlite(original, tmp_db)
     loaded = load_context_from_sqlite("test-roundtrip", tmp_db)
     assert loaded is not None
     assert loaded.session_id == "test-roundtrip"
     assert loaded.problem.error_type == "NPE"
-    assert loaded.current_judgment.category == "A"
-    assert loaded.current_judgment.confidence == 0.85
+    assert len(loaded.hypotheses.hypotheses) == 1
+    best = loaded.hypotheses.best
+    assert best.category == JudgmentCategory.A
+    assert best.confidence == 0.85
 
 
 def test_load_nonexistent_returns_none(tmp_db):

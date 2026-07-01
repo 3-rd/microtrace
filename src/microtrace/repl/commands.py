@@ -16,7 +16,7 @@ def cmd_status(ctx: Context | None) -> bool:
     console.print(f"State: {state}")
     console.print(f"Iteration: {ctx.iteration}/{ctx.max_iterations}")
     console.print(f"Evidence: {len(ctx.evidence)} 条")
-    console.print(f"Judgment: {ctx.current_judgment.to_brief()}")
+    console.print(f"Hypotheses: {len(ctx.hypotheses.hypotheses)} 个\n{ctx.hypotheses.to_brief()}")
     return True
 
 
@@ -39,24 +39,35 @@ def cmd_evidence(ctx: Context | None) -> bool:
     return True
 
 
-def cmd_judgment(ctx: Context | None) -> bool:
-    """显示判断历史"""
+def cmd_hypotheses(ctx: Context | None) -> bool:
+    """显示假设集"""
     from rich.console import Console
     console = Console()
     if not ctx:
         console.print("No active session")
         return True
 
-    console.print(f"\n判断历史（{len(ctx.judgment_history)} 次更新）：\n")
-    for i, j in enumerate(ctx.judgment_history, 1):
-        marker = "★" if i > 1 and j.category != ctx.judgment_history[i - 2].category else ""
-        console.print(f"  #{i}  {j.category}({j.confidence:.2f}) {marker}")
-        console.print(f"      {j.one_line_reason}\n")
-
-    console.print(
-        f"当前: {ctx.current_judgment.category} "
-        f"({ctx.current_judgment.confidence:.2f})"
-    )
+    console.print(f"\n假设集（{len(ctx.hypotheses.hypotheses)} 个）：\n")
+    for i, h in enumerate(ctx.hypotheses.hypotheses, 1):
+        marker = "→" if h.id == ctx.hypotheses.current_focus else " "
+        status_color = {
+            "candidate": "yellow",
+            "investigating": "blue",
+            "confirmed": "green",
+            "ruled_out": "red",
+        }.get(h.status.value if hasattr(h.status, 'value') else str(h.status), "white")
+        console.print(
+            f"  {marker} #{i} [{status_color}]{h.status.value}[/{status_color}] "
+            f"{h.category.value}({h.confidence:.2f})"
+        )
+        console.print(f"      {h.statement[:120]}")
+        if h.ruled_out_reason:
+            console.print(f"      [red]排除: {h.ruled_out_reason[:100]}[/red]")
+        if h.evidence_for:
+            console.print(f"      [green]evidence_for: {len(h.evidence_for)}[/green]")
+        if h.evidence_against:
+            console.print(f"      [red]evidence_against: {len(h.evidence_against)}[/red]")
+        console.print()
     return True
 
 
@@ -120,7 +131,8 @@ COMMANDS: dict[str, Callable] = {
     "/save": cmd_save,
     "/clear": cmd_clear,
     "/config": cmd_config,
-    "/judgment": cmd_judgment,
+    "/judgment": cmd_hypotheses,
+    "/hypotheses": cmd_hypotheses,
     "/exit": cmd_exit,
     "/quit": cmd_exit,
 }
@@ -137,5 +149,5 @@ def dispatch(cmd: str, ctx: Context | None) -> bool:
     if fn:
         return fn(ctx)
     console.print(f"[yellow]未知命令: {cmd}[/yellow]")
-    console.print("可用: /status /evidence /judgment /save /clear /config /exit")
+    console.print("可用: /status /evidence /hypotheses  /judgment /save /clear /config /exit")
     return True

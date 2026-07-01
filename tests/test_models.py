@@ -1,9 +1,11 @@
 import pytest
 from microtrace.context.models import (
-    Context, Problem, Judgment, Evidence, ToolCall, UserReply,
+    Context, Problem, Hypothesis, HypothesisSet, HypothesisStatus,
+    Evidence, ToolCall, UserReply,
     CompactionRecord, AgentEvent, QuestionOption, QuestionPrompt,
     State, SessionStatus, EvidenceSource, EvidenceImportance,
     ContentType, StreamEventType, ToolState, JudgmentCategory,
+    DiagnosisClaim, ConfidenceTier, DiagnosisPattern, PatternStatus,
 )
 
 
@@ -15,12 +17,17 @@ def test_context_roundtrip():
             raw_input="NPE at UserService.java:42",
             error_type="NullPointerException",
         ),
-        current_judgment=Judgment(
-            category="A", confidence=0.85,
-            one_line_reason="NPE in our code",
-            reasoning="analyzed the stack trace"
-        ),
     )
+
+    # 加一个 hypothesis
+    h = Hypothesis(
+        statement="NPE in our code",
+        category=JudgmentCategory.A,
+        confidence=0.85,
+        status=HypothesisStatus.CONFIRMED,
+    )
+    original.hypotheses.add(h)
+    original.hypotheses.confirm(h.id)
 
     # 序列化
     json_str = original.model_dump_json()
@@ -29,7 +36,8 @@ def test_context_roundtrip():
     restored = Context.model_validate_json(json_str)
 
     assert restored.session_id == original.session_id
-    assert restored.current_judgment.category == "A"
+    assert len(restored.hypotheses.hypotheses) == 1
+    assert restored.hypotheses.best.category == JudgmentCategory.A
     assert restored.problem.error_type == "NullPointerException"
 
 

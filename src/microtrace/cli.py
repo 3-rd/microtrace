@@ -1,4 +1,4 @@
-"""Typer CLI entry point"""
+"""Typer CLI entry point (Phase 1: +dry-run, +patterns)"""
 from __future__ import annotations
 import time
 import typer
@@ -9,12 +9,88 @@ app = typer.Typer(invoke_without_command=True)
 @app.callback()
 def main(
     ctx: typer.Context,
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Dry-run 模式：工具只读不写，记录 trace（SPEC §1.6）",
+    ),
+    trace_dir: str = typer.Option(
+        None, "--trace-dir",
+        help="Trace 文件输出目录（dry-run 模式使用）",
+    ),
+    input_text: str = typer.Option(
+        None, "--input", "-i",
+        help="直接传入问题文本（非交互模式）",
+    ),
 ):
     """microtrace - Java microservice problem diagnosis Agent"""
     if ctx.invoked_subcommand is None:
-        # 无子命令 → 启动 REPL
         from microtrace.repl.main import run_repl
-        run_repl()
+
+        # Dry-run 模式
+        if dry_run:
+            typer.echo(f"[dry-run] 工具只读，trace 输出到 {trace_dir or './traces/'}")
+            run_repl(dry_run=True, trace_dir=trace_dir)
+
+        # 非交互模式（--input）
+        elif input_text:
+            _run_headless(input_text, dry_run, trace_dir)
+
+        # 默认：交互式 REPL
+        else:
+            run_repl()
+
+
+def _run_headless(input_text: str, dry_run: bool = False, trace_dir: str | None = None) -> None:
+    """非交互模式：直接传入问题文本，运行 agent 并输出结论"""
+    import asyncio
+    from microtrace.agent.loop import run_session
+    from microtrace.config import Config
+    from microtrace.tools import get_default_registry
+    from microtrace.llm import create_default_client
+
+    async def _run():
+        config = Config.load()
+        llm = create_default_client()
+        tools = get_default_registry()
+        ctx = await run_session(
+            initial_input=input_text,
+            llm=llm,
+            tools=tools,
+        )
+        if dry_run and ctx.dry_run:
+            ctx.trace_dir = trace_dir
+        return ctx
+
+    ctx = asyncio.run(_run())
+    if ctx.final_output:
+        typer.echo(ctx.final_output)
+    else:
+        typer.echo(ctx.hypotheses.to_brief())
+
+
+@app.command()
+def patterns(
+    limit: int = typer.Option(20, "--limit", "-n", help="显示最近 N 个模式"),
+):
+    """List diagnosis patterns (Phase 1 机制 6)"""
+    from microtrace.persistence.sqlite import load_patterns
+    from microtrace.config import get_db_path
+
+    rows = load_patterns(str(get_db_path()))
+    if not rows:
+        typer.echo("没有保存的诊断模式")
+        return
+
+    typer.echo(f"{'ID':<12} {'Status':<10} {'Accuracy':<8} {'Category':<8} Symptom")
+    typer.echo("-" * 80)
+    for r in rows[:limit]:
+        typer.echo(
+            f"{r.get('id', '')[:10]:<12} "
+            f"{r.get('status', ''):<10} "
+            f"{r.get('accuracy', 0):.0%:<8} "
+            f"{r.get('category', ''):<8} "
+            f"{r.get('symptom_signature', '')[:50]}"
+        )
 
 
 @app.command()
@@ -60,7 +136,7 @@ def resume(
     state = ctx.state if isinstance(ctx.state, str) else ctx.state.value
     typer.echo(
         f"状态: state={state}, iter={ctx.iteration}/{ctx.max_iterations}, "
-        f"evidence={len(ctx.evidence)}, judgment={ctx.current_judgment.category}"
+        f"evidence={len(ctx.evidence)}, hypotheses={len(ctx.hypotheses.hypotheses)}"
     )
     run_repl(ctx=ctx)
 

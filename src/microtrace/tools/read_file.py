@@ -50,6 +50,6 @@ class ReadFileTool(Tool):
             content = "".join(lines[start:end])
 
             header = f"--- {params.file_path} (lines {start+1}-{end} of {len(lines)}) ---\n"
-            return ToolResult(success=True, output=header + content)
+            return ToolResult(success=True, content=header + content)
         except Exception as e:
             return ToolResult(success=False, error=str(e))

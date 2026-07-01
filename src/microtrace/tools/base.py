@@ -13,7 +13,7 @@ class ToolInput(BaseModel):
 class ToolResult(BaseModel):
     """Tool 执行结果"""
     success: bool = True
-    output: str = ""
+    content: str = ""
     error: str | None = None
 
 

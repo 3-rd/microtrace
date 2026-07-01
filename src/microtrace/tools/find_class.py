@@ -42,7 +42,7 @@ class FindClassTool(Tool):
             if not matches:
                 return ToolResult(
                     success=True,
-                    output=f"未找到类: {params.class_name}（在 {root} 下）",
+                    content=f"未找到类: {params.class_name}（在 {root} 下）",
                 )
 
             results: list[str] = []
@@ -66,7 +66,7 @@ class FindClassTool(Tool):
 
             return ToolResult(
                 success=True,
-                output=f"找到 {len(results)} 个匹配：\n" + "\n".join(results),
+                content=f"找到 {len(results)} 个匹配：\n" + "\n".join(results),
             )
         except Exception as e:
             return ToolResult(success=False, error=str(e))

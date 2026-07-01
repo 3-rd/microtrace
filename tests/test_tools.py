@@ -23,8 +23,8 @@ async def test_read_file_happy_path():
             "file_path": path, "offset": 0, "limit": 10
         })
         assert result.success
-        assert "line 1" in result.output
-        assert "line 5" in result.output
+        assert "line 1" in result.content
+        assert "line 5" in result.content
     finally:
         os.unlink(path)
 
@@ -41,9 +41,9 @@ async def test_read_file_with_offset_limit():
         })
         assert result.success
         # offset=3 (0-based) = 第 4 行（line 4），limit=2 = line 4-5
-        assert "line 4" in result.output
-        assert "line 5" in result.output
-        assert "line 6" not in result.output
+        assert "line 4" in result.content
+        assert "line 5" in result.content
+        assert "line 6" not in result.content
     finally:
         os.unlink(path)
 
@@ -103,8 +103,8 @@ async def test_search_logs_happy_path():
             "keyword": "ERROR", "log_dir": tmpdir
         })
         assert result.success
-        assert "NullPointerException" in result.output
-        assert "找到 1 条匹配" in result.output
+        assert "NullPointerException" in result.content
+        assert "找到 1 条匹配" in result.content
 
 
 @pytest.mark.asyncio
@@ -118,9 +118,9 @@ async def test_search_logs_multi_keywords():
             "keyword": "ERROR,WARN", "log_dir": tmpdir
         })
         assert result.success
-        assert "foo" in result.output
-        assert "bar" in result.output
-        assert "baz" not in result.output
+        assert "foo" in result.content
+        assert "bar" in result.content
+        assert "baz" not in result.content
 
 
 @pytest.mark.asyncio
@@ -143,7 +143,7 @@ async def test_search_logs_no_match():
             "keyword": "nonexistent_xyz_abc", "log_dir": tmpdir
         })
         assert result.success
-        assert "未找到" in result.output
+        assert "未找到" in result.content
 
 
 # ── find_class ───────────────────────────────────────────────
@@ -165,8 +165,8 @@ async def test_find_class_happy_path():
             "class_name": "UserService", "search_root": tmpdir
         })
         assert result.success
-        assert "UserService" in result.output
-        assert "UserService.java" in result.output
+        assert "UserService" in result.content
+        assert "UserService.java" in result.content
 
 
 @pytest.mark.asyncio
@@ -177,7 +177,7 @@ async def test_find_class_not_found():
             "class_name": "NonExistent", "search_root": tmpdir
         })
         assert result.success
-        assert "未找到" in result.output
+        assert "未找到" in result.content
 
 
 @pytest.mark.asyncio
@@ -200,9 +200,9 @@ async def test_parse_stack_trace_happy_path():
 """
     result = await ParseStackTraceTool().execute({"stack_text": stack})
     assert result.success
-    assert "Bar.java:42" in result.output
-    assert "Main.java:10" in result.output
-    assert "Caused by" in result.output  # critical line extracted
+    assert "Bar.java:42" in result.content
+    assert "Main.java:10" in result.content
+    assert "Caused by" in result.content  # critical line extracted
 
 
 @pytest.mark.asyncio
@@ -210,7 +210,7 @@ async def test_parse_stack_trace_empty():
     """parse_stack_trace 空文本"""
     result = await ParseStackTraceTool().execute({"stack_text": ""})
     assert result.success
-    assert "空" in result.output
+    assert "空" in result.content
 
 
 @pytest.mark.asyncio
@@ -220,7 +220,7 @@ async def test_parse_stack_trace_no_frames():
         "stack_text": "Some random text without stack frames"
     })
     assert result.success
-    assert "未解析到" in result.output
+    assert "未解析到" in result.content
 
 
 @pytest.mark.asyncio
@@ -234,9 +234,9 @@ async def test_parse_stack_trace_top_n():
     })
     assert result.success
     # top 3 = File0, File1, File2 出现在"解析到的堆栈帧"部分
-    assert "File0.java:0" in result.output
-    assert "File2.java:2" in result.output
+    assert "File0.java:0" in result.content
+    assert "File2.java:2" in result.content
     # 验证只有 3 个 frame 编号（1./2./3.）
     import re
-    frame_lines = [l for l in result.output.split("\n") if re.match(r"^\s+\d+\.\s", l)]
+    frame_lines = [l for l in result.content.split("\n") if re.match(r"^\s+\d+\.\s", l)]
     assert len(frame_lines) == 3

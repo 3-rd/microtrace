@@ -46,7 +46,7 @@ class ParseStackTraceTool(Tool):
         try:
             text = params.stack_text or ""
             if not text.strip():
-                return ToolResult(success=True, output="堆栈文本为空")
+                return ToolResult(success=True, content="堆栈文本为空")
 
             lines = text.split("\n")
             frames: list[dict] = []
@@ -74,7 +74,7 @@ class ParseStackTraceTool(Tool):
             if not frames:
                 return ToolResult(
                     success=True,
-                    output=f"未解析到堆栈帧：\n{text[:500]}",
+                    content=f"未解析到堆栈帧：\n{text[:500]}",
                 )
 
             top = frames[: params.top_n]
@@ -89,6 +89,6 @@ class ParseStackTraceTool(Tool):
                 for cl in critical_lines[:10]:
                     result_lines.append(f"  - {cl}")
 
-            return ToolResult(success=True, output="\n".join(result_lines))
+            return ToolResult(success=True, content="\n".join(result_lines))
         except Exception as e:
             return ToolResult(success=False, error=str(e))

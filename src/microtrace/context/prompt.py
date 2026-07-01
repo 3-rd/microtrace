@@ -12,7 +12,7 @@ from microtrace.tools import ToolRegistry
 
 
 # 永不压缩区（SPEC §4.3.2）
-NEVER_COMPACT_KEYS = {"problem", "current_judgment", "pending_question"}
+NEVER_COMPACT_KEYS = {"problem", "hypotheses", "diagnosis_claim", "pending_question"}
 
 # importance 排序：critical > supporting > background
 IMPORTANCE_ORDER = [
@@ -55,14 +55,28 @@ def _format_problem(ctx: Context) -> str:
     return "\n".join(parts)
 
 
-def _format_judgment(judgment) -> str:
-    return (
-        f"## 当前判断\n\n"
-        f"**类别**: {judgment.category}\n"
-        f"**置信度**: {judgment.confidence:.2f}\n"
-        f"**理由**: {judgment.one_line_reason}\n"
-        f"**推理**: {judgment.reasoning}"
-    )
+def _format_hypotheses(ctx: Context) -> str:
+    """格式化 HypothesisSet（替代旧 _format_judgment）"""
+    if not ctx.hypotheses.hypotheses:
+        return "## 当前假设\n（暂无，等待 LLM 提出假设）"
+
+    parts = ["## 当前假设集"]
+    if ctx.hypotheses.current_focus:
+        parts.append(f"**当前聚焦**: `{ctx.hypotheses.current_focus[:8]}`")
+
+    for hyp in ctx.hypotheses.hypotheses:
+        marker = "→" if hyp.id == ctx.hypotheses.current_focus else " "
+        parts.append(
+            f"\n{marker} **[{hyp.status.value}]** {hyp.category.value}({hyp.confidence:.2f}): "
+            f"{hyp.statement[:200]}"
+        )
+        if hyp.evidence_for:
+            parts.append(f"  evidence_for: {len(hyp.evidence_for)} 条")
+        if hyp.evidence_against:
+            parts.append(f"  evidence_against: {len(hyp.evidence_against)} 条")
+        if hyp.ruled_out_reason:
+            parts.append(f"  排除原因: {hyp.ruled_out_reason[:100]}")
+    return "\n".join(parts)
 
 
 def _format_evidence_pool(
@@ -135,16 +149,49 @@ def _format_tools(tools: ToolRegistry) -> str:
     return "\n".join(lines)
 
 
-def _build_instruction(ctx: Context) -> str:
+def _format_diagnosis_claim(claim) -> str:
+    """格式化 DiagnosisClaim 注入 prompt"""
     return (
-        f"## 指令\n\n"
-        f"- 当前处于第 {ctx.iteration} 轮（共最多 {ctx.max_iterations} 轮）\n"
-        f"- 每条结论必须引用证据（证据编号或文件:行号）\n"
-        f"- 证据不足时，明确说\"我无法判断，需要 X 信息\"\n"
-        f"- 使用工具获取事实，不要臆测\n"
-        f"- 输出格式：用 `{{@action: conclude, text: ...}}` 表示输出结论，"
-        f"`{{@action: ask_user, question: ...}}` 表示询问用户"
+        "## 诊断声明（待验证）\n\n"
+        f"**类别**: {claim.category}\n"
+        f"**声明**: {claim.statement[:200]}\n"
+        f"**引用证据**: {len(claim.evidence_refs)} 条\n"
+        f"**置信度分层**: {claim.confidence_tier}\n"
     )
+
+
+def _build_instruction(ctx: Context) -> str:
+    parts = [
+        "## 指令",
+        "",
+        f"- 当前处于第 {ctx.iteration} 轮（共最多 {ctx.max_iterations} 轮）",
+        f"- 推理跳数: Hop {ctx.current_hop}",
+        f"- 置信度分层: {ctx.confidence_tier.value if hasattr(ctx.confidence_tier, 'value') else ctx.confidence_tier}",
+        "- 每条结论必须引用证据（证据 ID 或文件:行号）",
+        "- 证据不足时，明确说\"我无法判断，需要 X 信息\"",
+        "- 使用工具获取事实，不要臆测",
+        "- 使用鉴别诊断：提出 2-4 个假设，逐个排除",
+        "- 输出格式：",
+        "  - 新假设：`{@hypothesis: {\"statement\": \"...\", \"category\": \"A|B|C\", \"confidence\": 0.6}}`",
+        "  - 聚焦：`{@focus_hypothesis: \"hypothesis_id\"}`",
+        "  - 确认：`{@confirm: \"hypothesis_id\"}`",
+        "  - 排除：`{@rule_out: {\"id\": \"hypothesis_id\", \"reason\": \"...\"}}`",
+        "  - 结论：`{@action: conclude, text: ...}`",
+        "  - 询问：`{@action: ask_user, question: ...}`",
+    ]
+    # Pattern hint 注入（机制 6）
+    if ctx.matched_patterns:
+        try:
+            from microtrace.agent.pattern_store import PatternStore
+            from microtrace.config import get_data_dir
+            store = PatternStore(file_path=str(get_data_dir() / "patterns.json"))
+            hint_text = store.get_hints(ctx)
+            if hint_text:
+                parts.append("\n" + hint_text)
+        except Exception:
+            pass
+
+    return "\n".join(parts)
 
 
 def _load_system_prompt() -> str:
@@ -190,8 +237,12 @@ def _assemble_prompt(ctx: Context, tools: ToolRegistry) -> str:
     # 2. Problem（永不压缩）
     sections.append(_format_problem(ctx))
 
-    # 3. Judgment（永不压缩）
-    sections.append(_format_judgment(ctx.current_judgment))
+    # 3. Hypotheses（替代旧 Judgment，永不压缩）
+    sections.append(_format_hypotheses(ctx))
+
+    # 3b. DiagnosisClaim（如果存在）
+    if ctx.diagnosis_claim:
+        sections.append(_format_diagnosis_claim(ctx.diagnosis_claim))
 
     # 4. Evidence Pool + Compaction Summary
     evidence_text = _format_evidence_pool(ctx.evidence, max_items=5, max_content_len=500)

@@ -102,7 +102,7 @@ async def get_state(session_id: str):
         "state": state,
         "iteration": ctx.iteration,
         "max_iterations": ctx.max_iterations,
-        "judgment": ctx.current_judgment.to_brief(),
+        "hypotheses": ctx.hypotheses.to_brief(),
         "evidence_count": len(ctx.evidence),
     }
 

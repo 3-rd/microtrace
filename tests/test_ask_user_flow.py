@@ -1,7 +1,8 @@
 """ASK_USER 流转测试（修复 ASK_USER resume 后语义）"""
 import pytest
 from microtrace.context.models import (
-    Context, State, Problem, Judgment, JudgmentCategory,
+    Context, State, Problem, Hypothesis, HypothesisSet, HypothesisStatus,
+    JudgmentCategory,
     QuestionPrompt, QuestionOption, UserReply,
 )
 

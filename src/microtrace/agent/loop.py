@@ -1,4 +1,11 @@
-"""Agent 主循环 (SPEC §4.2) — 双层结构：run_session 外层 + agent_iteration 内层"""
+"""Agent 主循环 (SPEC §4.2) — 双层结构：run_session 外层 + agent_iteration 内层
+
+Phase 1 集成：
+  - 证据锚定：_conclude() → validate_claim()
+  - 逐跳 Gate：run_session() 外层 check_hop_gate()
+  - 矛盾检测：agent_iteration() post-tool check_evidence_contradiction()
+  - 鉴别诊断：HypothesisSet 替代 Judgment
+"""
 from __future__ import annotations
 import asyncio
 import json
@@ -13,7 +20,11 @@ from microtrace.context.models import (
     State,
     Problem,
     StackFrame,
-    Judgment,
+    Hypothesis,
+    HypothesisSet,
+    HypothesisStatus,
+    DiagnosisClaim,
+    ConfidenceTier,
     JudgmentCategory,
     Evidence,
     EvidenceSource,
@@ -25,6 +36,7 @@ from microtrace.context.models import (
     StreamEventType,
     QuestionPrompt,
     CompactionRecord,
+    GateResult,
 )
 from microtrace.context.prompt import _assemble_prompt, determine_content_type
 from microtrace.context.compaction import compact, is_overflow, extract_microtrace_critical_lines
@@ -34,11 +46,14 @@ from microtrace.agent.doom_loop import (
     build_doom_loop_question,
     apply_doom_loop_answer,
 )
+from microtrace.agent.confidence import compute_confidence_tier, tier_to_action, is_ready_to_conclude
+from microtrace.agent.hop_gate import check_hop_gate, get_gate_action
+from microtrace.agent.contradiction import check_evidence_contradiction, apply_contradiction_result
 from microtrace.tools import ToolRegistry
 from microtrace.llm import LLMError
 
 
-# ── helpers ────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────
 
 def _summarize_args(args: dict) -> str:
     """工具参数摘要（Doom Loop / 显示用）"""
@@ -58,19 +73,58 @@ def _summarize_output(output: str, max_len: int = 200) -> str:
 def _parse_text_action(text: str) -> dict:
     """
     从 LLM 文本中解析 action 声明
-    格式：{@action: conclude, text: ...} 或 {@action: ask_user, question: ...}
+
+    Phase 1 扩展支持：
+      {@action: conclude, text: ...}
+      {@action: ask_user, question: ...}
+      {@hypothesis: {...}}
+      {@focus_hypothesis: "id"}
+      {@confirm: "id"}
+      {@rule_out: {"id": "...", "reason": "..."}}
+      {@diagnosis_claim: {...}}
     """
     if not text:
         return {}
-    pattern = r"\{@action:\s*(\w+)(?:,\s*(\w+):\s*([^}]*))?\}"
-    m = re.search(pattern, text)
-    if not m:
-        return {}
-    action = m.group(1)
-    if action == "conclude":
-        return {"action": "conclude", "text": m.group(3) or text}
-    elif action == "ask_user":
-        return {"action": "ask_user", "question": m.group(3) or text}
+
+    # 标准 action
+    m = re.search(r"\{@action:\s*(\w+)(?:,\s*(\w+):\s*([^}]*))?\}", text)
+    if m:
+        action = m.group(1)
+        if action == "conclude":
+            return {"action": "conclude", "text": m.group(3) or text}
+        elif action == "ask_user":
+            return {"action": "ask_user", "question": m.group(3) or text}
+
+    # Phase 1: hypothesis 相关 action
+    for tag in ["@hypothesis", "@focus_hypothesis", "@confirm", "@rule_out", "@diagnosis_claim"]:
+        pattern = rf"\{{{tag}:\s*([^}}]*)\}}"
+        m = re.search(pattern, text)
+        if m:
+            return _parse_hypothesis_action(tag, m.group(1))
+
+    return {}
+
+
+def _parse_hypothesis_action(tag: str, content: str) -> dict:
+    """解析 Phase 1 假设相关 action"""
+    try:
+        if tag == "@hypothesis":
+            data = json.loads(content)
+            return {"action": "hypothesis", "data": data}
+        elif tag == "@focus_hypothesis":
+            hyp_id = content.strip().strip('"').strip("'")
+            return {"action": "focus_hypothesis", "id": hyp_id}
+        elif tag == "@confirm":
+            hyp_id = content.strip().strip('"').strip("'")
+            return {"action": "confirm_hypothesis", "id": hyp_id}
+        elif tag == "@rule_out":
+            data = json.loads(content)
+            return {"action": "rule_out_hypothesis", "id": data.get("id"), "reason": data.get("reason", "")}
+        elif tag == "@diagnosis_claim":
+            data = json.loads(content)
+            return {"action": "diagnosis_claim", "data": data}
+    except json.JSONDecodeError:
+        pass
     return {}
 
 
@@ -81,7 +135,7 @@ def _generate_session_id() -> str:
     return f"{ts}-{short}"
 
 
-# ── INTAKE ─────────────────────────────────────────────────────
+# ── INTAKE ───────────────────────────────────────────────────────
 
 async def _intake(ctx: Context, initial_input: str, llm) -> None:
     """
@@ -160,7 +214,7 @@ async def _intake(ctx: Context, initial_input: str, llm) -> None:
     })
 
 
-# ── 工具执行 ───────────────────────────────────────────────────
+# ── 工具执行 ─────────────────────────────────────────────────────
 
 async def _execute_one_tool(
     ctx: Context,
@@ -181,8 +235,8 @@ async def _execute_one_tool(
             raise PermissionError(f"工具 {tc.name} 已被禁用")
 
         result = await tool.execute(tc.args)
-        tc.output_raw = result.output
-        tc.output_summary = _summarize_output(result.output)
+        tc.output_raw = result.content
+        tc.output_summary = _summarize_output(result.content)
         tc.state = ToolState.COMPLETED
         ctx.append_reasoning(f"[工具完成] {tc.name} → {tc.output_summary[:80]}")
 
@@ -233,20 +287,20 @@ async def _execute_tools_parallel(
     )
 
 
-# ── MAX_ITERATIONS 强制总结 ──────────────────────────────────
+# ── MAX_ITERATIONS 强制总结 ────────────────────────────────────
 
-def _format_judgment_fallback(ctx: Context) -> str:
-    """LLM 不可用时的兜底输出"""
-    judgment = ctx.current_judgment
-    if judgment.category == JudgmentCategory.UNKNOWN:
+def _format_hypothesis_fallback(ctx: Context) -> str:
+    """LLM 不可用时的 Hypothesis 兜底输出"""
+    best = ctx.hypotheses.best
+    if not best:
         return "Agent 未能形成结论（异常退出）"
 
     lines = [
         "## 尽力而为的判断",
         "",
-        f"**类别**: {judgment.category}",
-        f"**置信度**: {judgment.confidence:.2f}",
-        f"**理由**: {judgment.one_line_reason}",
+        f"**类别**: {best.category.value if hasattr(best.category, 'value') else best.category}",
+        f"**置信度**: {best.confidence:.2f}",
+        f"**假设**: {best.statement}",
         "",
         f"## 已知证据（{len(ctx.evidence)} 条）",
     ]
@@ -262,24 +316,26 @@ def _format_judgment_fallback(ctx: Context) -> str:
 def _build_forced_summary_prompt(ctx: Context) -> str:
     """构建 MAX_ITERATIONS 强制总结 prompt"""
     problem_raw = ctx.problem.raw_input[:500] if ctx.problem else ""
+    hypothesis_brief = ctx.hypotheses.to_brief() if ctx.hypotheses.hypotheses else "无假设"
+
     return (
         f"CRITICAL - MAXIMUM ITERATIONS REACHED\n\n"
         f"你已用 {ctx.iteration}/{ctx.max_iterations} 轮。工具调用已被禁用。"
         f"你必须用纯文本回答。\n\n"
         f"## 问题\n{problem_raw}\n\n"
-        f"## 当前判断\n{ctx.current_judgment.to_brief()}\n\n"
+        f"## 当前假设集\n{hypothesis_brief}\n\n"
         f"## 证据数：{len(ctx.evidence)} 条\n\n"
         f"## 最近推理\n" + "\n".join(f"- {s}" for s in ctx.reasoning_trace[-5:]) +
         "\n\n请按以下结构回答：\n"
         "1. 已调查的内容（引用证据）\n"
-        "2. 当前最佳判断（A/B/C）和置信度\n"
+        "2. 当前最佳假设（A/B/C）和置信度\n"
         "3. 未能验证的剩余 gap\n"
         "4. 建议下一步调查方向"
     )
 
 
 async def _force_max_iter_summary(ctx: Context, llm) -> None:
-    """MAX_ITERATIONS 强制总结（LLM 失败用 judgment 兜底）"""
+    """MAX_ITERATIONS 强制总结（LLM 失败用 hypothesis 兜底）"""
     ctx.append_reasoning("[MAX_ITERATIONS] 强制总结")
     forced_prompt = _build_forced_summary_prompt(ctx)
     try:
@@ -287,35 +343,131 @@ async def _force_max_iter_summary(ctx: Context, llm) -> None:
         async for ev in llm.stream(forced_prompt, tools=[]):
             if ev.type == StreamEventType.TEXT_DELTA and ev.text:
                 text_parts.append(ev.text)
-        ctx.final_output = "".join(text_parts) or _format_judgment_fallback(ctx)
+        ctx.final_output = "".join(text_parts) or _format_hypothesis_fallback(ctx)
     except Exception as e:
-        ctx.append_reasoning(f"[MAX_ITERATIONS] 强制总结 LLM 失败: {e}，用 judgment 兜底")
-        ctx.final_output = _format_judgment_fallback(ctx)
+        ctx.append_reasoning(f"[MAX_ITERATIONS] 强制总结 LLM 失败: {e}，用 hypothesis 兜底")
+        ctx.final_output = _format_hypothesis_fallback(ctx)
 
 
-# ── CONCLUDE ──────────────────────────────────────────────────
+# ── 证据锚定验证（机制 1）─────────────────────────────────────
+
+def validate_claim(claim: DiagnosisClaim, ctx: Context) -> tuple[bool, str]:
+    """
+    硬验证 DiagnosisClaim（代码层，非 LLM 判断）
+
+    验证规则：
+      1. evidence_refs 不能为空
+      2. 每条 evidence_ref 必须在 ctx.evidence 中存在
+      3. 至少 1 条 critical evidence
+      4. category 不能是 UNKNOWN
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not claim.evidence_refs:
+        return False, "evidence_refs 为空（违反机制 1：证据锚定）"
+
+    if len(claim.evidence_refs) < 2:
+        return False, f"evidence_refs 不足: {len(claim.evidence_refs)}（最少需要 2 条）"
+
+    # 验证每条 evidence_ref 都存在
+    existing_ids = {ev.id for ev in ctx.evidence}
+    for ref in claim.evidence_refs:
+        if ref not in existing_ids:
+            return False, f"evidence_ref '{ref}' 不存在于 ctx.evidence 中"
+
+    # 至少 1 条 critical
+    critical_evidence = {
+        ev.id for ev in ctx.evidence
+        if ev.content_type == ContentType.CRITICAL or ev.importance == EvidenceImportance.CRITICAL
+    }
+    has_critical = bool(set(claim.evidence_refs) & critical_evidence)
+    if not has_critical:
+        return False, "引用的 evidence 中没有 critical 级别"
+
+    # category 不能是 UNKNOWN
+    if claim.category == JudgmentCategory.UNKNOWN:
+        return False, "category 为 UNKNOWN，拒绝输出"
+
+    return True, ""
+
+
+# ── CONCLUDE ────────────────────────────────────────────────────
 
 async def _conclude(ctx: Context) -> str:
-    """CONCLUDE 态：格式化输出"""
+    """
+    CONCLUDE 态：格式化输出 + 证据锚定验证（机制 1）
+
+    流程：
+      1. 如果有 LLM 产出的 final_output → 直接返回
+      2. 如果有 DiagnosisClaim → validate_claim() → 通过后格式化
+      3. 否则用 HypothesisSet 的 best hypothesis 兜底
+    """
     if ctx.final_output:
         return ctx.final_output
 
+    # 尝试从 diagnosis_claim 格式化
+    claim = ctx.diagnosis_claim
+    if claim:
+        is_valid, error = validate_claim(claim, ctx)
+        if not is_valid:
+            ctx.append_reasoning(f"[validate_claim FAILED] {error}")
+            ctx.append_event("claim.validation_failed", {"error": error})
+            # 降级：用 best hypothesis
+            return _format_hypothesis_conclusion(ctx)
+
+        ctx.append_reasoning(f"[validate_claim PASSED] evidence_refs={len(claim.evidence_refs)}")
+        return _format_claim_conclusion(claim, ctx)
+
+    # 兜底：用 best hypothesis
+    return _format_hypothesis_conclusion(ctx)
+
+
+def _format_claim_conclusion(claim: DiagnosisClaim, ctx: Context) -> str:
+    """格式化 DiagnosisClaim 为人类可读输出"""
     lines = [
         "# 问题诊断结论",
         "",
-        f"**类别**: {ctx.current_judgment.category}",
-        f"**置信度**: {ctx.current_judgment.confidence:.2f}",
-        f"**理由**: {ctx.current_judgment.one_line_reason}",
+        f"**类别**: {claim.category.value if hasattr(claim.category, 'value') else claim.category}",
+        f"**置信度分层**: {claim.confidence_tier.value if hasattr(claim.confidence_tier, 'value') else claim.confidence_tier}",
+        f"**结论**: {claim.statement}",
         "",
         "## 证据链",
     ]
-    for ev in ctx.evidence:
-        if ev.importance == EvidenceImportance.CRITICAL:
+    for ev_id in claim.evidence_refs:
+        ev = ctx.get_evidence_by_id(ev_id)
+        if ev:
             lines.append(f"- [{ev.source}] {ev.location}: {ev.content[:100]}")
     return "\n".join(lines)
 
 
-# ── 持久化辅助 ───────────────────────────────────────────────
+def _format_hypothesis_conclusion(ctx: Context) -> str:
+    """用 HypothesisSet 的 best hypothesis 兜底格式化输出"""
+    best = ctx.hypotheses.best
+    if not best:
+        return "Agent 未能形成结论"
+
+    lines = [
+        "# 问题诊断结论",
+        "",
+        f"**类别**: {best.category.value if hasattr(best.category, 'value') else best.category}",
+        f"**置信度**: {best.confidence:.2f}",
+        f"**状态**: {best.status.value if hasattr(best.status, 'value') else best.status}",
+        f"**假设**: {best.statement}",
+        "",
+        "## 全部假设",
+        ctx.hypotheses.to_brief(),
+        "",
+        "## 证据链",
+    ]
+    for ev_id in best.evidence_for:
+        ev = ctx.get_evidence_by_id(ev_id)
+        if ev:
+            lines.append(f"- [{ev.source}] {ev.location}: {ev.content[:100]}")
+    return "\n".join(lines)
+
+
+# ── 持久化辅助 ─────────────────────────────────────────────────
 
 async def _save_session(ctx: Context) -> None:
     from microtrace.persistence.sqlite import save_context_to_sqlite
@@ -326,7 +478,7 @@ async def _save_session(ctx: Context) -> None:
         ctx.append_reasoning(f"[SAVE] 失败: {e}")
 
 
-# ── agent_iteration（内层：单次 stream）─────────────────────
+# ── agent_iteration（内层：单次 stream）───────────────────────
 
 async def agent_iteration(
     ctx: Context,
@@ -335,12 +487,10 @@ async def agent_iteration(
 ) -> None:
     """
     内层 processor：单次 LLM stream 迭代
-    - Doom Loop 检测
-    - Prompt 组装
-    - LLM 流式调用
-    - 事件处理（tool_call / ask_user / conclude）
-    - 工具执行
-    - overflow 检查
+
+    Phase 1 新增：
+      - 解析 hypothesis 相关 action（{@hypothesis, @focus, @confirm, @rule_out}）
+      - Post-tool 矛盾检测（机制 5）
     """
     if check_doom_loop(ctx):
         ctx.pending_question = build_doom_loop_question(ctx)
@@ -363,6 +513,7 @@ async def agent_iteration(
     question_text: str | None = None
     conclusion_text: str | None = None
     text_buffer: list[str] = []
+    new_evidence_ids: list[str] = []  # Phase 1: 本轮新增的 evidence ID
 
     try:
         async for event in llm.stream(prompt_text, tools=tools.schemas()):
@@ -374,10 +525,23 @@ async def agent_iteration(
             if event.type == StreamEventType.TEXT_DELTA and event.text:
                 text_buffer.append(event.text)
                 parsed = _parse_text_action(event.text)
+
                 if parsed.get("action") == "conclude" and not conclusion_text:
                     conclusion_text = parsed.get("text", "".join(text_buffer))
                 elif parsed.get("action") == "ask_user" and not question_text:
                     question_text = parsed.get("question", "".join(text_buffer))
+
+                # Phase 1: 处理 hypothesis 相关 action
+                elif parsed.get("action") == "hypothesis":
+                    _handle_hypothesis_action(ctx, parsed)
+                elif parsed.get("action") == "focus_hypothesis":
+                    _handle_focus_action(ctx, parsed)
+                elif parsed.get("action") == "confirm_hypothesis":
+                    _handle_confirm_action(ctx, parsed)
+                elif parsed.get("action") == "rule_out_hypothesis":
+                    _handle_rule_out_action(ctx, parsed)
+                elif parsed.get("action") == "diagnosis_claim":
+                    _handle_diagnosis_claim_action(ctx, parsed)
 
             elif event.type == StreamEventType.TOOL_CALL:
                 tool_name = event.tool_name or "unknown"
@@ -408,12 +572,19 @@ async def agent_iteration(
 
     ctx.append_event("step.finished", {"iteration": ctx.iteration})
 
+    # 记录本轮开始前的 evidence 数量
+    ev_count_before = len(ctx.evidence)
+
     # 4. 后处理
     if tool_calls_to_run:
         if len(tool_calls_to_run) > 1:
             await _execute_tools_parallel(ctx, tool_calls_to_run, tools)
         else:
             await _execute_one_tool(ctx, tool_calls_to_run[0], tools)
+
+        # Phase 1: 记录本轮新增的 evidence
+        for ev in ctx.evidence[ev_count_before:]:
+            new_evidence_ids.append(ev.id)
 
     elif question_text:
         ctx.pending_question = QuestionPrompt(
@@ -429,7 +600,16 @@ async def agent_iteration(
         ctx.final_output = conclusion_text
         ctx.append_reasoning(f"[LLM 自决结束] {conclusion_text[:100]}")
 
-    # 5. Overflow 检查
+    # 5. Phase 1: Post-tool 矛盾检测（机制 5）
+    for ev_id in new_evidence_ids:
+        ev = ctx.get_evidence_by_id(ev_id)
+        if ev:
+            contradiction = check_evidence_contradiction(ctx, ev)
+            if contradiction.found:
+                apply_contradiction_result(ctx, contradiction)
+                break  # 检测到矛盾后停止，避免级联
+
+    # 6. Overflow 检查
     try:
         if is_overflow(ctx):
             await compact(ctx, llm)
@@ -437,7 +617,80 @@ async def agent_iteration(
         ctx.append_reasoning(f"[OVERFLOW/COMPACTION ERROR] {e}")
 
 
-# ── run_session（外层：显式循环）─────────────────────────────
+# ── Phase 1: Hypothesis Action Handlers ─────────────────────────
+
+def _handle_hypothesis_action(ctx: Context, parsed: dict) -> None:
+    """处理 LLM 提出的新假设"""
+    data = parsed.get("data", {})
+    hyp = Hypothesis(
+        statement=data.get("statement", ""),
+        category=JudgmentCategory(data.get("category", "UNKNOWN")),
+        confidence=float(data.get("confidence", 0.5)),
+        status=HypothesisStatus.CANDIDATE,
+        created_at_iteration=ctx.iteration,
+        updated_at_iteration=ctx.iteration,
+    )
+    ctx.add_hypothesis(hyp)
+
+
+def _handle_focus_action(ctx: Context, parsed: dict) -> None:
+    """处理 LLM 聚焦某个假设"""
+    hyp_id = parsed.get("id", "")
+    if hyp_id:
+        ctx.hypotheses.set_focus(hyp_id)
+        ctx.append_reasoning(f"[聚焦假设] {hyp_id[:8]}")
+
+
+def _handle_confirm_action(ctx: Context, parsed: dict) -> None:
+    """处理 LLM 确认假设"""
+    hyp_id = parsed.get("id", "")
+    if hyp_id:
+        # 将本轮 evidence 关联到该假设
+        hyp = ctx.hypotheses.get(hyp_id)
+        if hyp:
+            recent_ev = [ev for ev in ctx.evidence if ev.discovered_at_iteration == ctx.iteration]
+            for ev in recent_ev:
+                hyp.add_supporting_evidence(ev.id)
+            ctx.hypotheses.confirm(hyp_id)
+            # 计算置信度分层
+            tier = compute_confidence_tier(hyp, ctx.evidence)
+            ctx.confidence_tier = tier
+            ctx.append_reasoning(
+                f"[假设确认] {hyp_id[:8]} tier={tier.value} "
+                f"evidence_for={len(hyp.evidence_for)}"
+            )
+
+
+def _handle_rule_out_action(ctx: Context, parsed: dict) -> None:
+    """处理 LLM 排除假设"""
+    hyp_id = parsed.get("id", "")
+    reason = parsed.get("reason", "")
+    if hyp_id:
+        # 将本轮 evidence 关联到否定列表
+        hyp = ctx.hypotheses.get(hyp_id)
+        if hyp:
+            recent_ev = [ev for ev in ctx.evidence if ev.discovered_at_iteration == ctx.iteration]
+            for ev in recent_ev:
+                hyp.add_contradicting_evidence(ev.id)
+        ctx.hypotheses.rule_out(hyp_id, reason)
+        ctx.append_reasoning(f"[假设排除] {hyp_id[:8]}: {reason[:80]}")
+
+
+def _handle_diagnosis_claim_action(ctx: Context, parsed: dict) -> None:
+    """处理 LLM 输出 DiagnosisClaim"""
+    data = parsed.get("data", {})
+    claim = DiagnosisClaim(
+        category=JudgmentCategory(data.get("category", "UNKNOWN")),
+        statement=data.get("statement", ""),
+        evidence_refs=data.get("evidence_refs", []),
+        hypothesis_ref=data.get("hypothesis_ref"),
+        confidence_tier=ConfidenceTier(data.get("confidence_tier", "suspected")),
+        created_at_iteration=ctx.iteration,
+    )
+    ctx.set_diagnosis_claim(claim)
+
+
+# ── run_session（外层：显式循环 + Gate）────────────────────────
 
 async def run_session(
     initial_input: str,
@@ -448,10 +701,11 @@ async def run_session(
 ) -> Context:
     """
     外层 driver：显式循环，驱动整个 session
-    - 管理 Context 生命周期
-    - 调用 agent_iteration() 单次迭代
-    - 处理状态转换
-    - 管理 session 持久化
+
+    Phase 1 新增（CLAUDE.md Q4 方案 B）：
+      - 每轮后检查 Gate（机制 2）
+      - Hop 跟踪
+      - Pattern 匹配（机制 6，INTAKE→INVESTIGATE 之间）
     """
     # 初始化 Context
     if ctx is None:
@@ -466,12 +720,10 @@ async def run_session(
     ctx.append_reasoning(f"[SESSION START] session_id={ctx.session_id}")
 
     # ── INTAKE 态 ──
-    # 恢复 ASK_USER：如果 ctx 已经在 ASK_USER 且有 user_replies，回到 INVESTIGATE
     if ctx.state == State.ASK_USER and ctx.user_replies:
         ctx.append_reasoning("[ASK_USER RESUME] 检测到 user_replies，回到 INVESTIGATE")
         await transition(ctx, State.INVESTIGATE, reason="用户已回复")
     elif ctx.state == State.ASK_USER:
-        # 继续等待（ctx.pending_question 还在）
         await _save_session(ctx)
         ctx.append_reasoning("[ASK_USER] 继续等待用户回复")
         return ctx
@@ -483,14 +735,18 @@ async def run_session(
         ctx.append_reasoning("[SESSION END] (after INTAKE EXIT)")
         return ctx
 
+    # ── Phase 1: Pattern 匹配（机制 6，INTAKE→INVESTIGATE 之间）──
+    _match_patterns(ctx)
+
     # ── INVESTIGATE 态：主循环 ──
+    ctx.increment_hop()  # Hop 1
     await transition(ctx, State.INVESTIGATE, reason="INTAKE 完成")
 
     while True:
         ctx.iteration += 1
-        ctx.append_reasoning(f"[开始第 {ctx.iteration} 轮]")
+        ctx.append_reasoning(f"[开始第 {ctx.iteration} 轮, Hop {ctx.current_hop}]")
 
-        # 退出条件 1：max_iterations 到达
+        # 退出条件 1：max_iterations
         if ctx.iteration > ctx.max_iterations:
             ctx.append_reasoning("[MAX_ITERATIONS] 到达，强制总结")
             await _force_max_iter_summary(ctx, llm)
@@ -503,11 +759,9 @@ async def run_session(
             await transition(ctx, State.CONCLUDE, reason="用户中断")
             break
 
-        # 退出条件 3：已有 final_output（LLM 自决结束）
+        # 退出条件 3：LLM 自决结束
         if ctx.final_output:
-            ctx.append_reasoning(
-                f"[LLM 自决结束] {ctx.final_output[:80]}..."
-            )
+            ctx.append_reasoning(f"[LLM 自决结束] {ctx.final_output[:80]}...")
             await transition(ctx, State.CONCLUDE, reason="LLM 自决")
             break
 
@@ -516,8 +770,6 @@ async def run_session(
 
         # ── 状态检查 ──
         if ctx.state == State.ASK_USER:
-            # ASK_USER 是硬阻塞：return ctx 给调用方（REPL/HTTP），
-            # 等用户回复后再 resume
             await _save_session(ctx)
             ctx.append_reasoning("[ASK_USER] 等用户回复")
             return ctx
@@ -528,6 +780,34 @@ async def run_session(
         if ctx.state == State.CONCLUDE:
             break
 
+        # ── Phase 1: Gate 检查（机制 2，方案 B：外层）──
+        gate_result = check_hop_gate(ctx)
+        gate_action = get_gate_action(gate_result)
+
+        if gate_result == GateResult.PASS:
+            ctx.increment_hop()
+            # 检查是否可以直接 conclude
+            if is_ready_to_conclude(ctx.confidence_tier):
+                ctx.append_reasoning(f"[GATE PASS + CERTAIN] 证据充分，提前结束")
+                await transition(ctx, State.CONCLUDE, reason="Gate PASS + tier=CERTAIN")
+                break
+
+        elif gate_result == GateResult.HOLD:
+            # 继续当前 hop，收集更多证据
+            ctx.append_reasoning("[GATE HOLD] 证据不足，继续当前 hop")
+
+        elif gate_result == GateResult.BACKTRACK:
+            # 回滚 hop
+            ctx.append_reasoning("[GATE BACKTRACK] 回滚到上一 hop")
+            if ctx.current_hop > 1:
+                ctx.current_hop -= 1
+
+        elif gate_result == GateResult.FAIL:
+            ctx.append_reasoning("[GATE FAIL] 致命矛盾，标记失败")
+            ctx.error = "Gate FAIL: 致命矛盾"
+            await transition(ctx, State.CONCLUDE, reason="Gate FAIL")
+            break
+
         # ── 每轮保存 ──
         await _save_session(ctx)
 
@@ -535,5 +815,38 @@ async def run_session(
     if not ctx.final_output:
         ctx.final_output = await _conclude(ctx)
     await _save_session(ctx)
+
+    # Phase 1: 成功完成后提取 pattern（机制 6）
+    _extract_pattern_on_success(ctx)
+
     ctx.append_reasoning("[SESSION END]")
     return ctx
+
+
+# ── Phase 1: Pattern 辅助函数（机制 6）─────────────────────────
+
+def _match_patterns(ctx: Context) -> None:
+    """INTAKE→INVESTIGATE 之间匹配诊断模式"""
+    try:
+        from microtrace.agent.pattern_store import PatternStore
+        from microtrace.config import get_data_dir
+        store = PatternStore(file_path=str(get_data_dir() / "patterns.json"))
+        store.match_and_inject(ctx)
+    except Exception as e:
+        ctx.append_reasoning(f"[Pattern 匹配] 失败: {e}")
+
+
+def _extract_pattern_on_success(ctx: Context) -> None:
+    """成功完成后提取诊断模式"""
+    try:
+        if not ctx.hypotheses.best:
+            return
+        from microtrace.agent.pattern_store import PatternStore
+        from microtrace.config import get_data_dir
+        store = PatternStore(file_path=str(get_data_dir() / "patterns.json"))
+        pattern = store.extract_from_session(ctx)
+        if pattern:
+            store.save()
+            ctx.append_reasoning(f"[Pattern 提取] pattern_id={pattern.id[:8]}")
+    except Exception as e:
+        ctx.append_reasoning(f"[Pattern 提取] 失败: {e}")

@@ -78,7 +78,7 @@ def _display_state(ctx: Context) -> None:
     table.add_row("状态", f"[{color}]{state}[/{color}]")
     table.add_row("轮次", f"{ctx.iteration}/{ctx.max_iterations}")
     table.add_row("证据", f"{len(ctx.evidence)} 条")
-    table.add_row("判断", ctx.current_judgment.to_brief())
+    table.add_row("假设", ctx.hypotheses.to_brief()[:120])
     console.print(table)
     console.print()
 
@@ -88,7 +88,11 @@ def _is_command(text: str) -> bool:
     return text.strip().startswith("/")
 
 
-def run_repl(ctx: Context | None = None) -> None:
+def run_repl(
+    ctx: Context | None = None,
+    dry_run: bool = False,
+    trace_dir: str | None = None,
+) -> None:
     """
     REPL 主入口
     - 加载配置
@@ -140,7 +144,12 @@ def run_repl(ctx: Context | None = None) -> None:
     print("Goodbye!")
 
 
-async def _run_agent(initial_input: str, ctx: Context | None) -> Context:
+async def _run_agent(
+    initial_input: str,
+    ctx: Context | None,
+    dry_run: bool = False,
+    trace_dir: str | None = None,
+) -> Context:
     """运行一次 agent session"""
     from microtrace.agent.loop import run_session
 
@@ -154,4 +163,7 @@ async def _run_agent(initial_input: str, ctx: Context | None) -> Context:
         tools=tools,
         ctx=ctx,
     )
+    if dry_run:
+        ctx.dry_run = True
+        ctx.trace_dir = trace_dir
     return ctx

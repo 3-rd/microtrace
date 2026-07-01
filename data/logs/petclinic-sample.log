@@ -1,0 +1,19 @@
+2026-07-01 10:23:15.123 ERROR [http-nio-8080-exec-3] o.s.p.c.o.OwnerController - Failed to process owner creation: NullPointerException
+2026-07-01 10:23:15.124 ERROR [http-nio-8080-exec-3] o.s.p.c.o.OwnerController - Exception in thread "http-nio-8080-exec-3" java.lang.NullPointerException
+	at org.springframework.samples.petclinic.owner.OwnerController.processCreationForm(OwnerController.java:87)
+	at org.springframework.samples.petclinic.owner.OwnerController.initCreationForm(OwnerController.java:45)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:190)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:138)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:105)
+Caused by: java.lang.IllegalArgumentException: Owner address must not be null
+	at org.springframework.samples.petclinic.owner.Owner.setAddress(Owner.java:56)
+	at org.springframework.samples.petclinic.owner.OwnerController.processCreationForm(OwnerController.java:82)
+	... 42 more
+2026-07-01 10:23:15.125 WARN  [http-nio-8080-exec-3] o.s.p.c.o.OwnerController - Request body: {"firstName": "John", "lastName": "Doe", "city": "New York"}
+2026-07-01 10:23:18.456 INFO  [http-nio-8080-exec-4] o.s.p.c.v.VetController - showVetList called
+2026-07-01 10:24:02.789 ERROR [http-nio-8080-exec-5] o.s.p.c.p.PetController - Failed to fetch pet with id=999: javax.persistence.EntityNotFoundException
+2026-07-01 10:24:02.790 ERROR [http-nio-8080-exec-5] o.s.p.c.p.PetController - error code=404 returned status 404
+2026-07-01 10:24:02.791 FATAL [http-nio-8080-exec-5] o.s.p.c.p.PetController - Unable to find Pet with id 999
+2026-07-01 10:25:00.001 INFO  [scheduling-1] o.s.p.c.v.VetController - Scheduled vet cache refresh completed
