@@ -41,6 +41,55 @@
 
 > 参考 VISION.md §6，DESIGN.md §6
 
+### 1.4 Phase 1 Target: Six Mechanisms（设计蓝图）
+
+> 详细设计见 `docs/Microtrace-核心矛盾到机制推导.md`
+
+Phase 0 落地的是 OpenCode 验证过的通用 Agent 机制。Phase 1 的核心目标是**从"通用 Agent"升级为"问题定位专用 Agent"**——六个硬约束机制替代 prompt 软约束：
+
+| # | 机制 | 要解决的问题 | 关键模型/模块变更 |
+|---|------|------------|-----------------|
+| 1 | **证据锚定** | LLM 结论不可信 | `DiagnosisClaim`（强制 evidence_refs）+ `validate_claim()` |
+| 2 | **逐跳验证门控** | 推理链累积误差 | `check_hop_gate()` 规则引擎 + `ctx.current_hop` |
+| 3 | **鉴别诊断** | LLM 确认偏倚 | `HypothesisSet` 替代 `Judgment` 单例，candidate/investigating/confirmed/ruled-out 四态 |
+| 4 | **置信度分层** | LLM 过度自信 | `compute_confidence_tier()` 规则引擎，Certain/Likely/Suspected/Ruled-out → action 映射 |
+| 5 | **矛盾强制回溯** | 新证据推翻旧假设 | `check_evidence_contradiction()` + 自动标记回滚 |
+| 6 | **诊断模式进化** | 重复问题冷启动 | `PatternStore` 跨 session，症状匹配→注入 hint，active/stale/archived 三态 |
+
+**所有机制的共性**：代码层硬约束 > prompt 软约束。Gate 是规则引擎判断的（不是 LLM），矛盾是系统检测的（不是 LLM "请重新思考"）。
+
+### 1.5 Framework/Data Separation（架构原则）
+
+> 开发者在家用公开数据+好 LLM 写框架，在公司用内部数据+差 LLM 验证效果。框架和数据必须彻底分离。
+
+```
+microtrace（框架 repo）              microtrace-data（数据 repo，公司侧）
+─────────────────────               ──────────────────────────
+Agent Loop / 状态机 / 六机制         日志路径配置（config.yaml）
+Prompt 模板                          内部错误码映射
+工具定义（通用）                      调用链拓扑 / 包名约定
+Compaction / Doom Loop               脱敏日志样本（test fixtures）
+── 0 行领域代码 ──                   ── 0 行代码，纯配置+数据 ──
+```
+
+**约束**：
+- 框架代码中**不允许**出现 VNFM 专有路径、包名、错误码。全部走 config
+- `data/` 目录放一套公开示例数据（Spring PetClinic），跑通全部测试
+- 公司侧：`git pull` → 改 config → `pytest` → 看效果
+
+### 1.6 Dry-run Mode（测试基础设施）
+
+```bash
+microtrace --dry-run --input "订单服务 NPE" --trace-dir ./traces/
+```
+
+Dry-run 模式下：
+- 工具**只读不写**
+- 记录每个 iteration 的完整信息：工具调用链、参数、Gate 判定、矛盾检测结果
+- Trace 文件是纯结构化的（JSON），**不包含内部数据内容**——只记录"调了什么工具，参数是什么，Gate 是否通过"
+- 可带回家重放：用 trace 文件重建诊断过程，用好的 LLM 重新推理
+- 公司侧效果评估：跑完看 trace，判断 Agent 的决策链是否正确，LLM 推理质量问题记下来回家调 prompt
+
 ---
 
 ## 2. Architecture Overview
@@ -59,7 +108,11 @@ microtrace/
 │       │   ├── events.py         # 事件类型 + EventStore
 │       │   ├── loop.py           # run_session + agent_iteration（双层结构）
 │       │   ├── doom_loop.py      # Doom Loop 检测
-│       │   └── types.py          # AgentError 等
+│       │   ├── types.py          # AgentError 等
+│       │   ├── hop_gate.py       # [Phase 1] 逐跳验证规则引擎
+│       │   ├── contradiction.py  # [Phase 1] 矛盾检测 + 自动回溯
+│       │   ├── confidence.py     # [Phase 1] 置信度 tier 计算 + action 映射
+│       │   └── pattern_store.py  # [Phase 1] 诊断模式提取/匹配/进化/降级
 │       ├── tools/
 │       │   ├── __init__.py
 │       │   ├── base.py           # Tool.define 模式 + ToolResult
@@ -74,6 +127,7 @@ microtrace/
 │       ├── context/
 │       │   ├── __init__.py
 │       │   ├── models.py         # Problem / Judgment / Evidence / ToolCall / Context
+│       │   │                     # [Phase 1] + HypothesisSet + DiagnosisClaim + DiagnosisPattern
 │       │   ├── compaction.py     # CompactionRecord + compact()
 │       │   └── prompt.py         # _assemble_prompt + 5 条结构规则
 │       ├── repl/
@@ -90,6 +144,9 @@ microtrace/
 │       └── config.py             # platformdirs 路径 + config.yaml 加载
 ├── prompts/
 │   └── agent.md                  # Master prompt（8 sections）
+├── data/                         # 示例数据（Spring PetClinic，公开可用）
+│   ├── logs/                     # 示例日志文件
+│   └── src/                      # 示例 Java 源码
 ├── tests/
 │   ├── test_state_machine.py
 │   ├── test_loop.py
